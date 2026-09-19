@@ -267,7 +267,9 @@ function miracastConnectionSummary(phase, peerName, peerMac, mode, p2pFreqMHz) {
       return "Connected on " + freq + " · " + modeLabel
     return "Connected · " + modeLabel
   }
-  if (value === "connecting" || value === "dhcp" || value === "rtsp")
+  if (value === "dhcp" || value === "rtsp")
+    return "Wi‑Fi Direct up · waiting for video"
+  if (value === "connecting")
     return "Connecting…"
   if (value === "scanning") return "Scanning…"
   if (value === "error") return "Miracast error"

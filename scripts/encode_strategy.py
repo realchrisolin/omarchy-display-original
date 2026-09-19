@@ -73,6 +73,10 @@ def prepare_dmabuf_settings(settings: dict[str, Any]) -> dict[str, Any]:
         settings.setdefault("vaapiQp", 22)
         settings.setdefault("encodeQpMin", 15)
         settings.setdefault("encodeQpMax", 44)
+        settings.setdefault("bitrate", "8M")
+        settings.setdefault("vaapiBitrate", settings.get("bitrate") or "8M")
+        if settings.get("encodeWfdBitrateMbps") is None:
+            settings["encodeWfdBitrateMbps"] = 8.0
         settings["vaapiAsyncDepth"] = 1
         # QVBR needs ~2s VBV or Intel undershoots to ~3 Mbps despite b=.
         settings["vbvMultiplier"] = "2.0"
@@ -119,6 +123,12 @@ def apply_to_settings(
             settings["encodeQpMax"] = 44
         if settings.get("vaapiQp") is None:
             settings["vaapiQp"] = 22
+        if not str(settings.get("bitrate") or "").strip():
+            settings["bitrate"] = "8M"
+        if not str(settings.get("vaapiBitrate") or "").strip():
+            settings["vaapiBitrate"] = settings.get("bitrate") or "8M"
+        if settings.get("encodeWfdBitrateMbps") is None:
+            settings["encodeWfdBitrateMbps"] = 8.0
         # QVBR needs ~2s VBV or Intel undershoots to ~3 Mbps despite b=.
         settings["vbvMultiplier"] = "2.0"
         if retarget_engine and not settings.get("encodeStrategyPinnedEngine"):

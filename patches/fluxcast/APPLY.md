@@ -13,12 +13,20 @@ variables set by `miracast-ctl`; damage-aware capture remains opt-in.
 | `src/wfd/modes.py` | Full classic CEA table; CHP for M4; interlaced listed but not negotiated; default RTSP pick is best advertised progressive mode (`FLUXCAST_WFD_MODE_POLICY`) |
 | `src/wfd/constants.py` | CEA bit constants (0–16) + VESA 1200p |
 | `src/wfd/config.py` | `peer_address` for mode-state JSON; `WFDCEAMode.interlaced` |
-| `src/wfd/session.py` | SIGUSR1 capture rebind loop; peer MAC on media config; NM-path `--wfd-p2p-channel` |
+| `src/wfd/session.py` | SIGUSR1 ignore until capture ready; open WFD 7236 before USB connect; peer MAC on media config |
+| `src/wfd/privileged.py` | Unified `sudo` / `sudo -A` + graphical askpass; global timestamp ticket |
+| `src/wfd/ie.py` | Length-prefixed WFD Device Info + Local IP for `wfd_subelem_set` |
+| `src/wfd/encoding.py` | Generic IDR GOP (cap 30) and VBV; no per-brand name keys |
+| `src/wfd/proc.py` | Privileged process helpers used by dedicated USB wpa |
 | `src/wfd/p2p/device.py` | P2P OperChannel for 2.4GHz + non-DFS 5GHz (quiet-channel picks) |
+| `src/wfd/p2p/formation.py` | `freq_to_p2p_class_channel`; peer advertised freqs; 5 GHz listen maps to class 124 |
+| `src/wfd/p2p/peers.py` | USB dedicated scan / name parse |
+| `src/wfd/p2p/usb_dedicated.py` | Dedicated USB SoftMAC GO; PLAY-gated persistent invite; 1-stream CSA to 2.4 GHz |
 | `src/wfd/p2p/wpas.py` | Hard Connect `frequency=`; wait for `AP-STA-CONNECTED` before IP flush; remanage on failure |
-| `src/wfd/p2p/wpas_ip.py` | `sudo -n` elevation; `mark_managed` helper |
-| `src/wfd/p2p/dbus.py` | Privileged calls use `sudo -n` (no pkexec) |
-| `src/wfd/media/wlroots.py` | DMA-BUF `h264_vaapi`+CQP; ICC `-r`; LPCM path captures **`*.monitor` via `pw-cat --target`** (not mic/`pipewiresrc`/`ffmpeg -f pulse`) |
+| `src/wfd/p2p/wpas_ip.py` | Privileged DHCP/firewall; serve P2P device + STA MACs; skip recycle on live GO |
+| `src/wfd/p2p/dbus.py` | Privileged calls via `privileged.py` (no pkexec) |
+| `src/wfd/media/portal.py` | Tight VBV for all sinks (no LG 4 Mbps cap) |
+| `src/wfd/media/wlroots.py` | DMA-BUF `h264_vaapi`+CQP; ICC `-r`; ffmpeg IO watchdog; LPCM via `pw-cat --target` |
 | `src/wfd/wf_recorder.py` | Optional `FLUXCAST_WFD_WF_RECORDER_BIN` / `…_PROTO=icc` for PR #347 builds |
 | `src/wfd/media/pipeline.py` | Desktop `restart_video()`; stop LPCM muxer + close video/audio fds on restart |
 | `src/drivers/wfd_lpcm_mux.py` | WFD LPCM mux — AOSP PIDs (video `0x1011`, PCR `0x1000`), `0x83` + AU framing |
@@ -58,13 +66,21 @@ cp patches/fluxcast/src/wfd/mode_state.py         "$FLUXCAST_ROOT/src/wfd/"
 cp patches/fluxcast/src/wfd/modes.py              "$FLUXCAST_ROOT/src/wfd/"
 cp patches/fluxcast/src/wfd/constants.py          "$FLUXCAST_ROOT/src/wfd/"
 cp patches/fluxcast/src/wfd/config.py             "$FLUXCAST_ROOT/src/wfd/"
+cp patches/fluxcast/src/wfd/encoding.py           "$FLUXCAST_ROOT/src/wfd/"
+cp patches/fluxcast/src/wfd/ie.py                 "$FLUXCAST_ROOT/src/wfd/"
+cp patches/fluxcast/src/wfd/privileged.py         "$FLUXCAST_ROOT/src/wfd/"
+cp patches/fluxcast/src/wfd/proc.py               "$FLUXCAST_ROOT/src/wfd/"
 cp patches/fluxcast/src/wfd/session.py            "$FLUXCAST_ROOT/src/wfd/"
 mkdir -p "$FLUXCAST_ROOT/src/wfd/p2p"
 cp patches/fluxcast/src/wfd/p2p/device.py         "$FLUXCAST_ROOT/src/wfd/p2p/"
+cp patches/fluxcast/src/wfd/p2p/formation.py      "$FLUXCAST_ROOT/src/wfd/p2p/"
+cp patches/fluxcast/src/wfd/p2p/peers.py          "$FLUXCAST_ROOT/src/wfd/p2p/"
+cp patches/fluxcast/src/wfd/p2p/usb_dedicated.py  "$FLUXCAST_ROOT/src/wfd/p2p/"
 cp patches/fluxcast/src/wfd/p2p/wpas.py           "$FLUXCAST_ROOT/src/wfd/p2p/"
 cp patches/fluxcast/src/wfd/p2p/wpas_ip.py        "$FLUXCAST_ROOT/src/wfd/p2p/"
 cp patches/fluxcast/src/wfd/p2p/dbus.py           "$FLUXCAST_ROOT/src/wfd/p2p/"
 cp patches/fluxcast/src/wfd/media/wlroots.py      "$FLUXCAST_ROOT/src/wfd/media/"
+cp patches/fluxcast/src/wfd/media/portal.py       "$FLUXCAST_ROOT/src/wfd/media/"
 cp patches/fluxcast/src/wfd/media/pipeline.py     "$FLUXCAST_ROOT/src/wfd/media/"
 cp patches/fluxcast/src/wfd/wf_recorder.py        "$FLUXCAST_ROOT/src/wfd/"
 cp patches/fluxcast/src/wfd/probe.py              "$FLUXCAST_ROOT/src/wfd/"

@@ -7,6 +7,8 @@ full device names and WPS manufacturer/model when exposed.
 
 Safe while a cast is active: never ``p2p_flush`` / ``iw scan``. A short
 ``p2p_find`` (no flush) is used and aborted if the live P2P group drops.
+While a USB GO is live, discovery runs on the STA radio (AX201) so 5 GHz
+sinks (LG webOS, Roku, …) are visible without hopping the GO off channel.
 
 Usage:
   ./scripts/scan_miracast_sinks.py --timeout 5
@@ -367,6 +369,60 @@ def scan_nm(timeout: int, wifi_iface: Optional[str] = None) -> list[dict[str, An
             pass
 
 
+def _is_usb_wifi(iface: str) -> bool:
+    """True if iface is USB-attached Wi-Fi (udev …uN name or sysfs usb path)."""
+    if not iface:
+        return False
+    if "u" in iface.split("s")[-1]:
+        return True
+    try:
+        target = os.readlink(f"/sys/class/net/{iface}/device")
+    except OSError:
+        return False
+    return "usb" in target
+
+
+def _sta_discovery_iface(exclude: Optional[str] = None) -> Optional[str]:
+    """NM-managed STA wifi for discovery while a USB GO is live."""
+    try:
+        r = _run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"], timeout=4.0)
+    except Exception:
+        return None
+    connected: list[str] = []
+    other: list[str] = []
+    for ln in (r.stdout or "").splitlines():
+        parts = ln.split(":")
+        if len(parts) < 3:
+            continue
+        dev, typ, state = parts[0], parts[1], parts[2]
+        if typ != "wifi" or dev.startswith("p2p-"):
+            continue
+        if exclude and dev == exclude:
+            continue
+        if _is_usb_wifi(dev):
+            continue
+        if state == "connected":
+            connected.append(dev)
+        else:
+            other.append(dev)
+    return (connected or other or [None])[0]
+
+
+def _local_wifi_macs() -> set[str]:
+    macs: set[str] = set()
+    net = Path("/sys/class/net")
+    if not net.is_dir():
+        return macs
+    for p in net.iterdir():
+        if not (p / "wireless").exists() and not (p / "phy80211").exists():
+            continue
+        try:
+            macs.add((p / "address").read_text().strip().upper())
+        except OSError:
+            continue
+    return macs
+
+
 def _wifi_iface(prefer: Optional[str] = None) -> Optional[str]:
     """Resolve managed Wi-Fi iface (P2P-GO preferred, idle preferred)."""
     prefer = (prefer or os.environ.get("FLUXCAST_WFD_INTERFACE") or "").strip()
@@ -710,6 +766,8 @@ def _merge_peers(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 merged["wfd"] = False
             if peer.get("wfd") is True:
                 merged["wfd"] = True
+            if cur.get("source") == "active-session" or peer.get("source") == "active-session":
+                merged["wfd"] = True
             by_mac[mac] = merged
     return list(by_mac.values())
 
@@ -720,7 +778,12 @@ def _filter_miracast_sinks(peers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     Spec: WFD IE in P2P probe/assoc (wpa: wfd_subelems; NM: WfdIEs). Plain
     Wi-Fi Direct printers/PCs lack it (often WPS category 3 = Printer).
     """
-    return [p for p in peers if p.get("wfd") is True]
+    local = _local_wifi_macs()
+    return [
+        p
+        for p in peers
+        if p.get("wfd") is True and str(p.get("mac") or "").upper() not in local
+    ]
 
 
 def scan(
@@ -759,20 +822,29 @@ def scan(
             return _enrich_peers_with_wpa(cached, wifi_iface=resolved), "cache", meta
         raise RuntimeError("; ".join(errors) or "scan failed")
 
-    # Active cast: prefer short wpa find (proven safe without flush on AX201),
-    # also try NM StartFind, always merge readonly cache / current peer.
+    # Active USB GO: do not p2p_find on the GO radio (hops off listen, misses
+    # 5 GHz sinks). Discover on the STA NIC instead (AX201 / ChrisNet).
+    discover_iface = resolved
+    if resolved and _is_usb_wifi(resolved):
+        sta = _sta_discovery_iface(exclude=resolved)
+        if sta:
+            discover_iface = sta
+            meta["discovery_iface"] = sta
+    find_s = max(timeout, 8) if discover_iface != resolved else min(timeout, 5)
+
+    # Active cast: short wpa find (no flush) on the discovery iface; merge cache.
     discovered: list[dict[str, Any]] = []
     source = "cache+live"
     try:
         discovered = scan_wpa_safe(
-            min(timeout, 5), watch_groups=groups_before, wifi_iface=resolved
+            find_s, watch_groups=groups_before, wifi_iface=discover_iface
         )
         meta["live_discovery"] = True
         source = "wpa_cli+cache"
     except Exception as exc:
         errors.append(f"wpa_cli: {exc}")
         try:
-            discovered = scan_nm(min(timeout, 5), wifi_iface=resolved)
+            discovered = scan_nm(find_s, wifi_iface=discover_iface)
             if not _group_still_up(groups_before):
                 raise RuntimeError("P2P group dropped during NM scan")
             meta["live_discovery"] = True

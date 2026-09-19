@@ -1,3 +1,4 @@
+import os
 import signal
 import threading
 import time
@@ -8,15 +9,20 @@ from .config import WFDMediaConfig, WFDNotReady
 from .constants import WFD_RTSP_PORT, WFD_UIBC_PORT
 from .dump import report_ts_dump
 from .env import _is_hyprland_session, _is_wayland_session
-from .firewall import _close_wfd_firewall_port, _open_wfd_firewall_port
+from .firewall import (
+    _close_wfd_firewall_port, _open_wfd_firewall_port, _warn_if_ufw_may_block,
+)
+from .ie import WFDPeer
 from .p2p.device import (
     _set_p2p_device_name, _set_p2p_go_intent, _set_p2p_oper_channel,
 )
 from .p2p.nm import (
     _connect_peer, _deactivate_connection, _disconnect_device,
-    _nm_p2p_device_path, _wait_for_nm_activation,
+    _nm_p2p_device_path, _nm_p2p_uses_iwd, _wait_for_nm_activation,
 )
 from .p2p.peers import _scan_and_select
+from .p2p.usb_dedicated import _is_usb_wifi
+from .privileged import prime_privileged
 from .p2p.wpas import connect_via_wpa_supplicant, release_wpa_supplicant_connection
 from .probe import _active_rtsp_probe
 from .rtsp.rtsp_server import WFDRTSPServer
@@ -37,15 +43,28 @@ def _cleanup_step(label: str, action) -> None:
         print(f"[FluxCast WFD] Cleanup step '{label}' failed: {exc}")
 
 def start_experimental_backend(args) -> None:
-    report = run_diagnostics(skip_firewall=getattr(args, "wfd_no_firewall", False))
-    print_report(report)
-    print()
-
-    if not report.wfd_candidate:
-        raise WFDNotReady(
-            "Miracast/WFD is not ready on this machine yet. "
-            "Fix the warn/fail rows above, then run --wfd-scan."
+    # Health watcher unparks the Extend head as soon as the GO is up and
+    # SIGUSR1s FluxCast. The real handler is only installed after P2P/DHCP;
+    # default SIGUSR1 terminates the process (DHCP wait never finishes).
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+    print("[FluxCast WFD] Requesting administrator access (sudo)...")
+    prime_privileged()
+    usb_p2p = bool(args.wfd_interface and _is_usb_wifi(args.wfd_interface))
+    if usb_p2p:
+        print(
+            "[FluxCast WFD] USB P2P: skipping doctor/NM scan "
+            "(find on this iface races GO Negotiation)"
         )
+    else:
+        report = run_diagnostics(skip_firewall=getattr(args, "wfd_no_firewall", False))
+        print_report(report)
+        print()
+
+        if not report.wfd_candidate:
+            raise WFDNotReady(
+                "Miracast/WFD is not ready on this machine yet. "
+                "Fix the warn/fail rows above, then run --wfd-scan."
+            )
 
     monitor = None
     if not getattr(args, "wfd_test_pattern", False) and not getattr(args, "wfd_dry_run", False):
@@ -73,15 +92,65 @@ def start_experimental_backend(args) -> None:
                 from capture import prompt_monitor
                 monitor = prompt_monitor()
 
-    _set_p2p_device_name(args.wfd_interface)
-    peer = _scan_and_select(
-        args.wfd_interface, getattr(args, "wfd_peer", None), args.wfd_timeout
-    )
-    device_path = _nm_p2p_device_path(args.wfd_interface)
-    if not device_path:
-        raise WFDNotReady("NetworkManager P2P device disappeared before connection.")
+    using_iwd = False
+    if usb_p2p:
+        # Primary STA uses NetworkManager P2P. A USB secondary radio must not:
+        # NM scan/activate on that iface races remain-on-channel / Action TX
+        # with the dedicated wpa. Peer MAC or name is required.
+        selector = getattr(args, "wfd_peer", None)
+        if not selector:
+            raise WFDNotReady(
+                "USB Wi-Fi Direct requires --wfd-peer (MAC or name); "
+                "NetworkManager scan is not used on this iface."
+            )
+        addr = selector.lower() if ":" in selector else selector
+        peer = WFDPeer(address=addr, name=str(selector), source="usb-dedicated")
+        device_path = ""
+        print(
+            f"[FluxCast WFD] USB iface {args.wfd_interface}: skipping NetworkManager "
+            f"P2P scan; dedicated wpa will find {addr}"
+        )
+    else:
+        backend_probe_path = _nm_p2p_device_path(args.wfd_interface)
+        if not backend_probe_path:
+            raise WFDNotReady(
+                "NetworkManager did not expose a Wi-Fi P2P device before scanning."
+            )
+
+        using_iwd = _nm_p2p_uses_iwd(backend_probe_path)
+
+        if using_iwd:
+            print(
+                "[FluxCast WFD] NetworkManager is using IWD; "
+                "P2P device naming and GO intent stay under "
+                "NetworkManager/IWD control."
+            )
+        else:
+            _set_p2p_device_name(args.wfd_interface)
+
+        peer = _scan_and_select(
+            args.wfd_interface,
+            getattr(args, "wfd_peer", None),
+            args.wfd_timeout,
+        )
+
+        # Refresh the device after scanning. The scan may retry for tens of
+        # seconds, so the path used for the actual connection should be fresh.
+        device_path = _nm_p2p_device_path(args.wfd_interface)
+        if not device_path:
+            raise WFDNotReady(
+                "NetworkManager P2P device disappeared before connection."
+            )
+
+        using_iwd = _nm_p2p_uses_iwd(device_path)
 
     if getattr(args, "wfd_dry_run", False):
+        if usb_p2p:
+            print(
+                f"[FluxCast WFD] dry-run USB dedicated P2P to {peer.address} "
+                f"on {args.wfd_interface} (no NM activate)"
+            )
+            return
         _connect_peer(
             device_path,
             peer,
@@ -135,42 +204,73 @@ def start_experimental_backend(args) -> None:
     try:
         # Clear stale P2P device state from previous runs before new activation.
         try:
-            _disconnect_device(device_path)
+            if device_path:
+                _disconnect_device(device_path)
         except Exception:
             pass
+        if not getattr(args, "wfd_no_firewall", False):
+            # Open 7236 before GO/DHCP. The sink SYNs RTSP immediately after
+            # DHCPACK; opening the firewall afterwards drops that first try.
+            firewall_opened = _open_wfd_firewall_port(rtsp_port)
         rtsp.start()
+        if usb_p2p:
+            p2p_backend = "wpas"
         if p2p_backend == "wpas":
             # Bypasses NetworkManager's AddAndActivateConnection2 entirely -
             # see wpas.py's module docstring for why. connect_via_wpa_supplicant
             # handles GO-intent lowering internally, so it isn't done here.
-            wpas_data_iface = connect_via_wpa_supplicant(
-                args.wfd_interface, peer.address,
-                go_intent=getattr(args, "wfd_go_intent", 0),
-                rtsp_port=rtsp_port,
-                p2p_channel=getattr(args, "wfd_p2p_channel", None),
-            )
+            # USB (secondary) ifaces that share NM's wpa with a primary STA
+            # need a dedicated wpa_supplicant or groups form on the wrong phy.
+            from .p2p.usb_dedicated import connect_usb_dedicated
+            if usb_p2p:
+                # Default go_intent=0 (prefer sink as GO); connect path may
+                # fall back to 15. Do not force host-as-GO from session.
+                go_5ghz = bool(getattr(args, "wfd_go_5ghz", False))
+                env_5 = os.environ.get("FLUXCAST_WFD_GO_5GHZ", "").lower()
+                if env_5 in ("1", "true", "yes", "on"):
+                    go_5ghz = True
+                wpas_data_iface = connect_usb_dedicated(
+                    args.wfd_interface,
+                    peer.address,
+                    go_intent=getattr(args, "wfd_go_intent", 0),
+                    rtsp_port=rtsp_port,
+                    go_5ghz=go_5ghz,
+                )
+            else:
+                wpas_data_iface = connect_via_wpa_supplicant(
+                    args.wfd_interface, peer.address,
+                    go_intent=getattr(args, "wfd_go_intent", 0),
+                    rtsp_port=rtsp_port,
+                    p2p_channel=getattr(args, "wfd_p2p_channel", None),
+                )
         else:
             # Lower our GO intent before negotiation so the TV becomes the group
             # owner; most Miracast sinks only start the RTSP session in that role.
-            previous_go_intent = _set_p2p_go_intent(
-                args.wfd_interface, getattr(args, "wfd_go_intent", 0)
-            )
-            p2p_channel = getattr(args, "wfd_p2p_channel", None)
-            if p2p_channel is not None:
-                # NM wifi-p2p has no channel property; set OperChannel on wpa
-                # before AddAndActivateConnection2 (only applies if we are GO).
-                _set_p2p_oper_channel(args.wfd_interface, p2p_channel)
+            if not using_iwd:
+                previous_go_intent = _set_p2p_go_intent(
+                    args.wfd_interface, getattr(args, "wfd_go_intent", 0)
+                )
+                p2p_channel = getattr(args, "wfd_p2p_channel", None)
+                if p2p_channel is not None:
+                    # NM wifi-p2p has no channel property; set OperChannel on wpa
+                    # before AddAndActivateConnection2 (only applies if we are GO).
+                    _set_p2p_oper_channel(args.wfd_interface, p2p_channel)
             active_path = _connect_peer(
                 device_path,
                 peer,
                 rtsp_port=rtsp_port,
             )
+
             _wait_for_nm_activation(active_path)
 
         if not getattr(args, "wfd_no_firewall", False):
-            firewall_opened = _open_wfd_firewall_port(rtsp_port)
-            if getattr(args, "wfd_uibc", False):
+            uibc_enabled = getattr(args, "wfd_uibc", False)
+            if uibc_enabled:
                 uibc_firewall_opened = _open_wfd_firewall_port(WFD_UIBC_PORT)
+            ufw_ports = [(rtsp_port, "RTSP")]
+            if uibc_enabled:
+                ufw_ports.append((WFD_UIBC_PORT, "UIBC"))
+            _warn_if_ufw_may_block(ufw_ports)
 
         # Active probe for newer TVs (Samsung 2024++, some LGs)
         # It runs in a background thread to not block the main loop.
@@ -225,13 +325,21 @@ def start_experimental_backend(args) -> None:
             _cleanup_step("connection deactivate",
                           lambda: _deactivate_connection(active_path))
         if wpas_data_iface:
-            _cleanup_step(
-                "wpa_supplicant connection release",
-                lambda: release_wpa_supplicant_connection(
-                    args.wfd_interface, wpas_data_iface
-                ),
-            )
-        _cleanup_step("P2P device disconnect", lambda: _disconnect_device(device_path))
+            from .p2p.usb_dedicated import release_usb_dedicated
+            if usb_p2p:
+                _cleanup_step(
+                    "dedicated USB P2P release",
+                    lambda: release_usb_dedicated(args.wfd_interface),
+                )
+            else:
+                _cleanup_step(
+                    "wpa_supplicant connection release",
+                    lambda: release_wpa_supplicant_connection(
+                        args.wfd_interface, wpas_data_iface
+                    ),
+                )
+        if device_path:
+            _cleanup_step("P2P device disconnect", lambda: _disconnect_device(device_path))
         if previous_go_intent is not None:
             _cleanup_step(
                 "GO intent restore",

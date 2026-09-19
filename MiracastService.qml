@@ -235,7 +235,8 @@ Item {
     }
     return out
   }
-  readonly property bool active: Model.miracastIsActive(phase)
+  property bool linkUp: false
+  readonly property bool active: Model.miracastIsActive(phase) || linkUp
   readonly property bool connecting: phase === "connecting" || phase === "dhcp" || phase === "rtsp" || phase === "scanning"
   readonly property bool streaming: phase === "streaming"
   // Pill highlight: resolved path while streaming, else saved preference.
@@ -970,7 +971,8 @@ Item {
         try {
           var data = JSON.parse(String(text || "{}"))
           root.phase = String(data.phase || "idle")
-          root.running = data.running === true
+          root.running = data.running === true || data.running === "true"
+          root.linkUp = data.linkUp === true || data.linkUp === "true"
           root.statusText = Model.miracastPhaseHint(root.phase, data.message || "")
           if (data.mode) root.mode = String(data.mode)
           // Do NOT apply data.extendPosition from settings while Extend is live —

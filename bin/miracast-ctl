@@ -1779,6 +1779,8 @@ print("1" if v in (True,1,"1","true","yes","on") else "0")' "$(read_settings)" 2
     hypr_set_monitor_geometry "$headless" "1920x1080@30" "$PARKED_EXTEND_POS" "1" >/dev/null 2>&1 || true
     printf '%s\n' "$headless" >"$PARKED_FILE"
     kms_settle "USB P2P: parked $headless at $PARKED_EXTEND_POS (no eDP modeset)"
+    # Creating a headless output can steal the seat even at -12000x0.
+    force_seat_to_primary || true
     echo "$headless"
     return 0
   fi
@@ -1805,6 +1807,9 @@ print("1" if v in (True,1,"1","true","yes","on") else "0")' "$(read_settings)" 2
   fi
   # Restore the display's last active workspace (else any occupied WS).
   focus_occupied_extend_workspace "$headless" "$prefer_ws" || true
+  # Seed/focus above briefly activates the cast head; always give the laptop
+  # back keyboard + pointer so the cursor cannot strand on Extend.
+  force_seat_to_primary || true
   # Capture not bound yet — fingerprint is recorded on first healthy ensure/rebind.
   echo "$headless"
 }
@@ -2046,10 +2051,15 @@ for m in ms:
 print("1")
 ' "$primary" 2>/dev/null || echo 1)"
 
+  # warp_on_change_workspace would send the pointer to ext-1; suppress that
+  # while activating the TV desktop, then force the seat back to eDP.
+  timeout 2 hyprctl eval 'hl.config({ cursor = { no_warps = true } })' >/dev/null 2>&1 || true
   hyprctl dispatch "hl.dsp.focus({ monitor = \"${cast}\" })" >/dev/null 2>&1 || true
   hyprctl dispatch "hl.dsp.focus({ workspace = \"name:ext-1\", on_current_monitor = true })" >/dev/null 2>&1 || true
+  timeout 2 hyprctl eval 'hl.config({ cursor = { no_warps = false } })' >/dev/null 2>&1 || true
   hyprctl dispatch "hl.dsp.focus({ monitor = \"${primary}\" })" >/dev/null 2>&1 || true
   hyprctl dispatch "hl.dsp.focus({ workspace = \"${prev_ws}\" })" >/dev/null 2>&1 || true
+  force_seat_to_primary || true
   return 0
 }
 
@@ -2290,18 +2300,42 @@ unpark_usb_extend_if_grouped() {
   [[ -n "$name" ]] || return 0
   hypr_has_monitor "$name" || return 0
   p2p_group_up || return 0
-  # Do not modeset eDP during WPS. wpa.log is append-only — require a
-  # GROUP-STARTED after the last FORMATION_FAILED, not a stale hit.
-  if ! python3 - <<'PY'
+  # wpa.log is append-only. A leftover GO from the previous session still has
+  # GROUP-STARTED in the log and p2p_group_up=true, which used to unpark during
+  # the sudo password dialog and steal the seat off eDP. Require a GROUP-STARTED
+  # timestamp (wpa -t) after this connect parked the head.
+  if ! python3 - "$PARKED_FILE" <<'PY'
 from pathlib import Path
-p = Path("/tmp/fluxcast-usb-wpa/wpa.log")
+import sys
+parked = Path(sys.argv[1])
 try:
-    t = p.read_text(errors="replace")
+    park_t = parked.stat().st_mtime
 except OSError:
     raise SystemExit(1)
-start = t.rfind("P2P-GROUP-STARTED")
-fail = t.rfind("P2P-GROUP-FORMATION-FAILURE")
-raise SystemExit(0 if start > fail else 1)
+p = Path("/tmp/fluxcast-usb-wpa/wpa.log")
+try:
+    lines = p.read_text(errors="replace").splitlines()
+except OSError:
+    raise SystemExit(1)
+last_start = -1.0
+last_fail = -1.0
+for line in lines:
+    ts = None
+    if line[:1].isdigit():
+        try:
+            ts = float(line.split(":", 1)[0])
+        except ValueError:
+            ts = None
+    if "P2P-GROUP-STARTED" in line:
+        last_start = ts if ts is not None else 0.0
+    if "P2P-GROUP-FORMATION-FAILURE" in line:
+        last_fail = ts if ts is not None else 0.0
+if last_start < 0 or last_start <= last_fail:
+    raise SystemExit(1)
+# Stale group from before this park (leftover BSS).
+if last_start + 0.5 < park_t:
+    raise SystemExit(1)
+raise SystemExit(0)
 PY
   then
     return 0
@@ -2321,11 +2355,15 @@ PY
   kms_settle "after USB unpark $name"
   seed_extend_workspaces "$name" || true
   pin_extend_workspaces "$name" || true
-  focus_occupied_workspace_on_monitor "$name" || true
+  # Do not leave keyboard/pointer on the virtual head (invisible cursor on
+  # eDP, binds appear dead). seed already activates ext-1 then returns.
+  force_seat_to_primary || true
   rm -f "$PARKED_FILE"
   disconnect_log "unparked USB extend $name on-layout"
   load_icc_present_kick || true
-  ensure_extend_capture_healthy 2 force >/dev/null 2>&1 || true
+  # Do not SIGUSR1 here. Unpark runs at GROUP-STARTED, before FluxCast has
+  # installed its capture-restart handler — USR1 killed python in DHCP wait
+  # so RTSP never started while the TV already showed kenya connected.
 }
 
 # Park an Extend head far off-layout (no destroy). Preserves mode/scale when possible.
@@ -2361,31 +2399,43 @@ print("1920x1080@30 1")
 }
 
 # Force keyboard/pointer seat onto the laptop panel (eDP).
+# Hyprland 0.56 dispatchers are lua (`hl.dsp.*`). The old `focusmonitor` /
+# `movecursor X Y` forms are parse errors and left the seat on Extend.
 force_seat_to_primary() {
   local primary=""
   primary="$(primary_monitor_name)"
   [[ -n "$primary" ]] || return 0
+  hypr_try dispatch "hl.dsp.release_input_capture()"
   hypr_try dispatch "hl.dsp.focus({ monitor = \"${primary}\" })"
-  # Warp cursor onto primary so it cannot remain stranded on a parked head.
-  hyprctl -j monitors 2>/dev/null | python3 -c '
-import json,sys,subprocess
-want=sys.argv[1]
+  python3 - "$primary" <<'PY' 2>/dev/null || true
+import json, subprocess, sys
+want = sys.argv[1]
 try:
-    ms=json.load(sys.stdin)
+    ms = json.loads(subprocess.check_output(
+        ["timeout", "2", "hyprctl", "-j", "monitors"], text=True, timeout=3
+    ))
 except Exception:
     raise SystemExit
 for m in ms:
     if str(m.get("name") or "") != want:
         continue
-    x=int(m.get("x") or 0); y=int(m.get("y") or 0)
-    w=int(m.get("width") or 1920); h=int(m.get("height") or 1080)
-    cx=x + max(w//2, 1); cy=y + max(h//2, 1)
+    x = int(m.get("x") or 0)
+    y = int(m.get("y") or 0)
+    w = int(m.get("width") or 1920)
+    h = int(m.get("height") or 1080)
+    scale = float(m.get("scale") or 1) or 1.0
+    lw = max(int(round(w / scale)), 1)
+    lh = max(int(round(h / scale)), 1)
+    cx = x + lw // 2
+    cy = y + lh // 2
     subprocess.run(
-        ["timeout","2","hyprctl","dispatch",f"movecursor {cx} {cy}"],
+        ["timeout", "2", "hyprctl", "dispatch",
+         f"hl.dsp.cursor.move({{ x = {cx}, y = {cy} }})"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        timeout=3,
     )
     raise SystemExit
-' "$primary" 2>/dev/null || true
+PY
   hypr_try dispatch "hl.dsp.focus({ monitor = \"${primary}\" })"
 }
 
@@ -4721,8 +4771,13 @@ try:
     settings = json.loads(settings_raw)
 except Exception:
     settings = {}
-# If not running, keep last peer identity for UI but force idle-ish phase unless error
-if data.get("phase") not in ("error",):
+# FluxCast python may have died while the USB GO is still up (LG still
+# shows kenya connected). Do not force idle — the dropdown uses phase.
+if link_up == "true":
+    if data.get("phase") not in ("dhcp", "rtsp", "streaming"):
+        data["phase"] = "dhcp"
+    data["message"] = data.get("message") or "P2P up; waiting for sink IP / RTSP"
+elif data.get("phase") not in ("error",):
     if data.get("phase") in ("connecting", "dhcp", "rtsp", "streaming", "scanning"):
         data["phase"] = "idle"
         data["message"] = "Idle"
@@ -5576,17 +5631,37 @@ cmd_stop() {
     # (keep_workspaces=1) leaves a live BSS so Extend can attach without
     # re-running SoftMAC GO Neg (Confirm TX is racy).
     disconnect_log "user stop: removing USB P2P group ifaces"
-    python3 - <<'PY'
-import os, subprocess
+    # Dedicated wpa/p2p-* are root-owned. sudo -n is a no-op without a ticket;
+    # leftover DIRECT-* then makes the next Extend unpark during askpass.
+    local _root _ask
+    _root="$(resolve_fluxcast_root 2>/dev/null || true)"
+    _ask="${_root:+$_root/meta/fluxcast-askpass}"
+    [[ -x "$_ask" ]] || _ask="/usr/libexec/fluxcast-askpass"
+    python3 - "$_ask" <<'PY'
+import os, subprocess, sys
 from pathlib import Path
+ask = sys.argv[1]
+env = os.environ.copy()
+def run(argv):
+    cmd = list(argv)
+    if os.geteuid() != 0:
+        if ask and os.access(ask, os.X_OK):
+            env["SUDO_ASKPASS"] = ask
+            cmd = ["sudo", "-A", *argv]
+        else:
+            cmd = ["sudo", *argv]
+    subprocess.run(cmd, timeout=120, check=False, env=env,
+                   stdin=subprocess.DEVNULL, capture_output=True)
 for p in Path("/sys/class/net").glob("p2p-*"):
-    subprocess.run(["iw", "dev", p.name, "del"], timeout=3, check=False)
+    run(["iw", "dev", p.name, "del"])
 pidf = Path("/tmp/fluxcast-usb-wpa/wpa.pid")
 if pidf.exists():
     try:
-        os.kill(int(pidf.read_text().strip()), 15)
-    except Exception:
-        pass
+        pid = int(pidf.read_text().strip())
+    except ValueError:
+        pid = 0
+    if pid:
+        run(["kill", str(pid)])
 PY
   fi
   rm -f "$HEALTH_WATCH_PID_FILE"
@@ -5680,7 +5755,7 @@ cmd_start() {
   local settings
   settings="$(read_settings)"
   fps="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("fps","30"))' "$settings")"
-  bitrate="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("bitrate","4M"))' "$settings")"
+  bitrate="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("bitrate","8M"))' "$settings")"
   output_res="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("outputRes","1280x720"))' "$settings")"
   # Prefer explicit streamMode (e.g. 1920x1080p30) over loose fps/outputRes.
   eval "$(python3 -c 'import json,re,sys
@@ -5708,7 +5783,7 @@ if m:
     esac
   done
   [[ -n "$fps" ]] || fps="30"
-  [[ -n "$bitrate" ]] || bitrate="4M"
+  [[ -n "$bitrate" ]] || bitrate="8M"
   [[ -n "$output_res" ]] || output_res="1280x720"
 
   if [[ -z "$peer" ]]; then
@@ -5762,7 +5837,51 @@ PY
 
   # Peer/mode reconnect: keep the Extend desktop when preserve is on.
   # Explicit UI Stop does not pass --keep-workspaces (windows return to eDP).
-  if [[ "$(preserve_display_across_monitors)" == "1" ]]; then
+  # If a USB GO BSS is already up, do not cmd_stop — that kills FluxCast
+  # (and often the BSS) while the sink is still associated, then p2p_find
+  # cannot see the TV.
+  local _usb_go=""
+  _usb_go="$(python3 - <<'PY' 2>/dev/null || true
+from pathlib import Path
+import subprocess
+for p in Path("/sys/class/net").glob("p2p-*"):
+    try:
+        r = subprocess.run(["iw", "dev", p.name, "info"], capture_output=True, text=True, timeout=3)
+    except Exception:
+        continue
+    if "type P2P-GO" in r.stdout:
+        print(p.name)
+        break
+PY
+)"
+  if [[ -n "$_usb_go" ]]; then
+    echo "[miracast-ctl] USB GO $_usb_go still up; restarting FluxCast only (keep BSS)" >>"$LOG_DIR/cast.log"
+    stop_miracast_health_watcher || true
+    if [[ -f "$PID_FILE" ]]; then
+      local _old
+      _old="$(cat "$PID_FILE" 2>/dev/null || true)"
+      if [[ -n "$_old" ]]; then
+        kill -TERM "$_old" 2>/dev/null || true
+        sleep 0.4
+      fi
+      rm -f "$PID_FILE"
+    fi
+    python3 - <<'PY' 2>/dev/null || true
+import os, signal
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    try:
+        cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode()
+    except OSError:
+        continue
+    if "src/main.py" in cmd and "--protocol" in cmd and "wfd" in cmd:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+PY
+  elif [[ "$(preserve_display_across_monitors)" == "1" ]]; then
     cmd_stop --keep-workspaces >/dev/null
   else
     cmd_stop >/dev/null
@@ -6055,9 +6174,37 @@ print(str(s.get("vbvMultiplier") or "0.5").strip() or "0.5")
       export FLUXCAST_WFD_INTERFACE="$wifi_iface"
       echo "[miracast-ctl] P2P Wi-Fi iface=$wifi_iface" >>"$LOG_DIR/cast.log"
       if is_usb_wifi_iface "$wifi_iface"; then
-        if [[ "$go_intent" == "0" ]]; then
+        if [[ "$go_intent" == "0" || "$go_intent" -lt 8 ]]; then
           go_intent=15
           echo "[miracast-ctl] USB P2P: go_intent=15 first (GO; client Confirm TX drops on SoftMAC)" >>"$LOG_DIR/cast.log"
+        fi
+        # Pass peer listen MHz from last scan so USB PD/Neg hits that channel.
+        local _listen_mhz=""
+        _listen_mhz="$(python3 -c 'import json,sys
+mac=sys.argv[1].replace("-",":").upper()
+try:
+  rows=json.load(open(sys.argv[2]))
+except Exception:
+  rows=[]
+for p in rows:
+  if str(p.get("mac") or "").replace("-",":").upper()!=mac:
+    continue
+  for k in ("listenFreqMHz","operFreqMHz"):
+    v=p.get(k)
+    if v in (None,"",0,"0"):
+      continue
+    try:
+      n=int(v)
+    except Exception:
+      continue
+    if n>0:
+      print(n); raise SystemExit
+' "$peer" "$PEERS_FILE" 2>/dev/null || true)"
+        if [[ -n "$_listen_mhz" ]]; then
+          export FLUXCAST_PEER_LISTEN_MHZ="$_listen_mhz"
+          echo "[miracast-ctl] USB P2P: peer listen ${_listen_mhz} MHz from scan cache" >>"$LOG_DIR/cast.log"
+        else
+          unset FLUXCAST_PEER_LISTEN_MHZ 2>/dev/null || true
         fi
         local _go_5ghz=0
         _go_5ghz="$(python3 -c 'import json,sys
@@ -6191,16 +6338,20 @@ tx = vf = None
 for ln in reversed(lines):
     if "Sender health" not in ln:
         continue
-    m = re.search(r"tx\+(\d+)\s+KiB.*video_frames=(\d+)", ln)
-    if m:
-        tx, vf = int(m.group(1)), int(m.group(2))
-        break
-if tx is None or vf is None:
+    m = re.search(r"tx\+(\d+)\s+KiB", ln)
+    if not m:
+        continue
+    tx = int(m.group(1))
+    vm = re.search(r"video_frames=(\d+)", ln)
+    if vm:
+        vf = int(vm.group(1))
+    break
+if tx is None:
     print("no")
-elif vf < 30:
+elif vf is not None and vf < 30 and tx < 200:
     print("no")
 elif base_i is None:
-    print("yes" if vf >= 60 else "no")
+    print("yes" if tx >= 200 or (vf is not None and vf >= 60) else "no")
 elif (tx - base_i) >= 200:
     print("yes")
 else:
@@ -6319,22 +6470,17 @@ PY
       fi
 
       # Post-PLAY: P2P must stay up (5s miss → stop).
-      # Pre-PLAY: only trip if the group was up and then vanished for ~45s —
-      # never abort the initial handshake wait (start's own timeout owns that).
+      # Pre-PLAY: FluxCast owns handshake timeout. Persistent invite can
+      # bring a GO up then tear it down to fall back to GO Neg; killing
+      # here aborts before the TV can show an accept prompt.
       if p2p_group_up; then
         missing_link=0
         saw_p2p=1
         unpark_usb_extend_if_grouped || true
-      elif [[ "${saw_p2p:-0}" -eq 1 ]]; then
+      elif [[ "${saw_p2p:-0}" -eq 1 && "$saw_play" -eq 1 ]]; then
         missing_link=$((missing_link + 1))
-        local miss_limit=5
-        [[ "$saw_play" -eq 0 ]] && miss_limit=45
-        if [[ "$missing_link" -ge "$miss_limit" ]]; then
-          if [[ "$saw_play" -eq 1 ]]; then
-            write_status "error" "Sink disconnected after streaming started" "peer=$peer" "peerName=$peer_name" "mode=$mode" "running=false" >/dev/null
-          else
-            write_status "error" "P2P group lost before RTSP/PLAY" "peer=$peer" "peerName=$peer_name" "mode=$mode" "running=false" >/dev/null
-          fi
+        if [[ "$missing_link" -ge 5 ]]; then
+          write_status "error" "Sink disconnected after streaming started" "peer=$peer" "peerName=$peer_name" "mode=$mode" "running=false" >/dev/null
           echo "$(date -Iseconds) [miracast-ctl] P2P group gone (missing_link=$missing_link saw_play=$saw_play) — stopping" >>"$LOG_DIR/cast.log"
           kill "$pid" 2>/dev/null || true
           python3 - <<'PY'

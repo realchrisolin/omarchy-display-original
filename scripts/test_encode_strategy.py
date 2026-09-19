@@ -22,7 +22,17 @@ class EncodeStrategyTest(unittest.TestCase):
         self.assertEqual(s["captureEncode"], "dmabuf")
         self.assertEqual(s["vaapiRcMode"], "QVBR")
         self.assertEqual(s["encodeStrategyAbr"], "sv")
+        self.assertEqual(s["bitrate"], "8M")
+        self.assertEqual(s["vaapiBitrate"], "8M")
+        self.assertEqual(s["encodeWfdBitrateMbps"], 8.0)
         self.assertTrue(es.uses_sv_abr(s))
+
+    def test_smartview_keeps_existing_bitrate(self):
+        s: dict = {"encodeProfile": "best", "bitrate": "14M", "vaapiBitrate": "14M", "encodeWfdBitrateMbps": 14.0}
+        es.apply_to_settings(s, "smartview")
+        self.assertEqual(s["bitrate"], "14M")
+        self.assertEqual(s["vaapiBitrate"], "14M")
+        self.assertEqual(s["encodeWfdBitrateMbps"], 14.0)
 
     def test_performance_forces_cqp_dmabuf(self):
         s = {
@@ -59,6 +69,8 @@ class EncodeStrategyTest(unittest.TestCase):
         self.assertEqual(s["captureEncode"], "dmabuf")
         self.assertEqual(out["captureEncode"], "dmabuf")
         self.assertEqual(s["vaapiRcMode"], "QVBR")
+        self.assertEqual(s["bitrate"], "8M")
+        self.assertEqual(s["encodeWfdBitrateMbps"], 8.0)
 
     def test_starve_detector_triggers_after_streak(self):
         streak = 0
