@@ -136,9 +136,10 @@ def prepare_dmabuf_settings(settings: dict[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             gop_now = None
         if rc_now == "CBR":
-            # Keep an explicit GOP (15 = 0.25 s at 60 fps). Only replace 1 s leftovers.
-            if gop_now is None or gop_now >= 60 or gop_now <= 8:
-                settings["vaapiGop"] = 15 if one_sec >= 60 else 8
+            # 1 s IDR (GOP 60 at 60 fps). GOP 8/15 emptied a 0.25 s HRD
+            # once wf-recorder actually applied gop_size.
+            if gop_now is None or gop_now in (8, 15):
+                settings["vaapiGop"] = one_sec
             try:
                 vbv_now = float(settings.get("vbvMultiplier") or 0)
             except (TypeError, ValueError):

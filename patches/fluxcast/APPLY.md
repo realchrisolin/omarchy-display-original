@@ -28,10 +28,10 @@ variables set by `miracast-ctl`; damage-aware capture remains opt-in.
 | `meta/99-fluxcast-p2p.conf` | NM `unmanaged-devices` for `p2p-dev-*` and `p2p-*`; STA uplink stays managed |
 | `meta/85-fluxcast-p2p-unmanaged.rules` | udev `NM_UNMANAGED=1` on `p2p-*` at add so NM cannot race-kill the group iface |
 | `meta/zz-fluxcast-deny-remove-iface.conf` | Deny root `RemoveInterface` on wpa (NM was deleting p2p-wlp* 0.3ms after GroupStarted) |
-| `src/wfd/p2p/wpas_ip.py` | Privileged DHCP/firewall; serve P2P device + STA MACs; GARP after lease so sink can SYN RTSP; skip recycle on live GO |
+| `src/wfd/p2p/wpas_ip.py` | Privileged DHCP/firewall; serve P2P device + STA MACs; GARP after lease so sink can SYN RTSP; skip recycle on live GO; stop reaps leftover `fluxcast-dnsmasq` |
 | `src/wfd/p2p/dbus.py` | Privileged calls via `privileged.py` (no pkexec) |
 | `src/wfd/media/portal.py` | Tight VBV for all sinks (no LG 4 Mbps cap) |
-| `src/wfd/media/wlroots.py` | DMA-BUF `h264_vaapi`+CQP; ICC `-r`; ffmpeg IO watchdog; LPCM via `pw-cat --target`; AAC encoded in ffmpeg (ADTS), not copied from NUT |
+| `src/wfd/media/wlroots.py` | DMA-BUF `h264_vaapi`+CQP; ICC `-r`; ffmpeg IO watchdog (`wchar` for DMA LPCM); `encode stall` rebind (~4 s); LPCM via `pw-cat --target`; AAC encoded in ffmpeg (ADTS), not copied from NUT |
 | `src/wfd/wf_recorder.py` | Optional `FLUXCAST_WFD_WF_RECORDER_BIN` / `…_PROTO=icc` for PR #347 builds |
 | `src/wfd/media/pipeline.py` | Desktop `restart_video()`; stop LPCM muxer + close video/audio fds on restart |
 | `src/drivers/wfd_lpcm_mux.py` | WFD LPCM mux — AOSP PIDs (video `0x1011`, PCR `0x1000`), `0x83` + AU framing |

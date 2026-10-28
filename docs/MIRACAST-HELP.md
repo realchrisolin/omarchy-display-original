@@ -127,12 +127,13 @@ fps / `VIDEO_STALL` / UDP errors / TX≈0. A much quieter channel can trigger a 
 2. Confirm the TV is in Miracast / screen-mirroring receive mode.  
 3. If video is fine but silent: set Sound default to **Miracast** (or enable auto-switch) and raise that sink’s volume.  
 4. If Doctor says live encode ≠ settings: reconnect.  
-5. Frozen TV picture with audio still going: FluxCast should log `VIDEO_STALL` and rebind within a few seconds; if not, run `miracast-ctl restart-capture`. Check `cast.log` for `bufs_size` storms / ffmpeg IO watchdog. Do **not** treat switching to DMA-BUF as the only fix — pipe VAAPI should recover.  
+5. Frozen TV picture with audio still going: FluxCast should log `VIDEO_STALL` / `encode stall` and rebind within a few seconds (DMA `wchar` watchdog ~8 s); if not, run `miracast-ctl restart-capture`. Check `cast.log` for `bufs_size` storms / ffmpeg IO watchdog. Do **not** treat switching to DMA-BUF as the only fix — pipe VAAPI should recover.  
 6. Occasional brief glitches with audio OK and TX still ~12 Mbps: usually 2.4 GHz RF / MCC — try a quieter channel, lower bitrate slightly, or soft‑block Bluetooth; a 5 GHz‑capable sink is the lasting fix.  
 7. Logs: `~/.local/state/omarchy-miracast/logs/cast.log` / `link-watch.log`  
 8. Dropdown stuck on Connecting after a failed start: `miracast-ctl status` (or Start/Stop) clears stale `running=true` when the FluxCast pid is dead; then Reconnect.  
 9. Sink says connected but the picture is missing: P2P/RTSP can stay up while RTP is too lossy. FluxCast coalesces WFD IDR to one per GOP; an IDR burst drops QVBR (not iw retry%). Weak 5 GHz / USB GO is still RF-limited.  
 10. Connect dies ~45s after GO Neg (`P2P-GROUP-FORMATION-FAILURE`): wpa GO ACL may be the P2P interface MAC while the sink probes as the device MAC. FluxCast adds both to `accept_acl`. Retry with the sink in receive mode.  
-11. Laptop pointer gone / binds look dead after Extend, or you had to switch to TTY2: the cursor is usually on the parked virtual head, not a dead eDP. Do **not** `Ctrl+Alt+F1` back after restarting the shell or reloading the Hyprland renderer from TTY2 — that has hard-locked the machine (hold the power key). Reboot from the text VT, or see README § Virtual output lifecycle.
+11. Laptop pointer gone / binds look dead after Extend, or you had to switch to TTY2: the cursor is usually on the parked virtual head, not a dead eDP. Do **not** `Ctrl+Alt+F1` back after restarting the shell or reloading the Hyprland renderer from TTY2 — that has hard-locked the machine (hold the power key). Reboot from the text VT, or see README § Virtual output lifecycle.  
+12. Connect fails or DHCP never lands: a Wi-Fi STA on **192.168.49.0/24** (phone hotspot) clashes with WFD P2P. Start disconnects that STA; Ethernet stays up. Check `cast.log` for `P2P subnet clash`.
 
 CLI equivalents: `miracast-ctl doctor --fix`, `miracast-ctl info`, `miracast-ctl scan`.

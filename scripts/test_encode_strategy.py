@@ -108,7 +108,7 @@ class EncodeStrategyTest(unittest.TestCase):
         self.assertEqual(s["vaapiRcMode"], "CBR")
         self.assertEqual(s["captureEncode"], "dmabuf")
 
-    def test_prepare_cbr_shortens_one_second_gop(self):
+    def test_prepare_cbr_keeps_one_second_gop(self):
         s = {
             "encodeStrategy": "smartview",
             "encodeStrategyPinnedEngine": False,
@@ -117,8 +117,19 @@ class EncodeStrategyTest(unittest.TestCase):
             "streamMode": "1920x1080p60",
         }
         es.prepare_dmabuf_settings(s)
-        self.assertEqual(s["vaapiGop"], 15)
+        self.assertEqual(s["vaapiGop"], 60)
         self.assertEqual(s["vbvMultiplier"], "0.25")
+
+    def test_prepare_cbr_migrates_short_gop_to_one_second(self):
+        s = {
+            "encodeStrategy": "smartview",
+            "encodeStrategyPinnedEngine": False,
+            "vaapiRcMode": "CBR",
+            "vaapiGop": 15,
+            "streamMode": "1920x1080p60",
+        }
+        es.prepare_dmabuf_settings(s)
+        self.assertEqual(s["vaapiGop"], 60)
 
     def test_starve_detector_triggers_after_streak(self):
         streak = 0

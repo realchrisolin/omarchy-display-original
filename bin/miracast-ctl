@@ -279,6 +279,13 @@ is_usb_wifi_iface() {
   [[ "$n" =~ u[0-9]+$ ]] || [[ "$n" == *usb* ]]
 }
 
+# Phone hotspots often use 192.168.49.0/24, the WFD P2P subnet.
+warn_p2p_subnet_clash() {
+  local script="$PLUGIN_DIR/scripts/p2p_subnet_clash.py"
+  [[ -f "$script" ]] || return 0
+  python3 "$script" --fix >>"$LOG_DIR/cast.log" 2>&1 || true
+}
+
 # Resolve managed Wi-Fi iface for Miracast P2P (settings p2pWifiInterface / auto).
 resolve_p2p_wifi_iface() {
   local prefer settings script
@@ -4752,12 +4759,8 @@ data["fps"] = str(fps)
 # Record the stream fps. place_virtual_head clamps to advertised HEADLESS
 # modes (often only 60Hz) so we never invent a 30Hz headless mode.
 data["extendRefresh"] = int(fps)
-# CBR interactive: ~0.25 s IDR. QVBR/CQP keep ~1 s.
-rc = str(data.get("vaapiRcMode") or "").upper()
-if rc == "CBR":
-    data["vaapiGop"] = 15
-else:
-    data["vaapiGop"] = 30 if fps <= 30 else 60
+# 1 s IDR for CBR and QVBR (GOP 15 emptied 0.25 s HRD once applied).
+data["vaapiGop"] = 30 if fps <= 30 else 60
 with open(settings_path, "w", encoding="utf-8") as fh:
     json.dump(data, fh, separators=(",", ":"))
     fh.write("\n")
@@ -6228,6 +6231,7 @@ if not keep:
             pid = 0
         if pid:
             run(["kill", str(pid)])
+run(["pkill", "-f", "dnsmasq.*fluxcast-dnsmasq"])
 PY
   rm -f "$HEALTH_WATCH_PID_FILE" "$PLAY_GRACE_FILE"
   # keep_workspaces=1 is cmd_start's internal previous-session stop; the
@@ -7006,6 +7010,7 @@ PY
 
   : > "$LOG_FILE"
   : > "$LAT_FILE"
+  warn_p2p_subnet_clash
   local label="${peer_name:-$peer}"
   local action_word="Mirroring"
   [[ "$mode" == "extend" ]] && action_word="Extending"

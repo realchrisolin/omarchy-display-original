@@ -4,7 +4,7 @@ import Quickshell.Hyprland
 import Quickshell.Io
 import "LayoutModel.js" as LayoutModel
 
-// Always-on layout host, parented by DisplayLayoutPanel (bar widget).
+// Always-on layout host, parented by DisplayPanel (bar widget).
 // Not a separate plugin service: Qt reports "File name case mismatch" when
 // createComponent loads through the realchrisolin.monitor symlink.
 // Keeps physical monitors in the saved left-to-right order. Miracast virtual
@@ -25,6 +25,7 @@ Item {
 
   property var shell: null
   property var manifest: null
+  property bool singletonOwner: true
 
   readonly property string orderPath: Quickshell.env("HOME") + "/.config/omarchy/monitor-layout.json"
   readonly property string statusPath: Quickshell.env("HOME") + "/.local/state/omarchy-miracast/status.json"
@@ -62,6 +63,8 @@ Item {
     interval: 300
     repeat: false
     onTriggered: {
+      if (!root.singletonOwner)
+        return
       var st = root.parseStatus()
       if (LayoutModel.shouldHoldLayout(st, lockFile.loaded))
         return
@@ -72,6 +75,7 @@ Item {
   Connections {
     target: Hyprland
     function onRawEvent(event) {
+      if (!root.singletonOwner) return
       if (!event || !event.name) return
       switch (String(event.name)) {
       case "monitoradded":

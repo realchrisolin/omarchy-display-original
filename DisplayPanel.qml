@@ -22,6 +22,18 @@ Panel {
   ipcTarget: "realchrisolin.monitor"
   manageIpc: false
 
+  // Bar widgets are copied per screen. Only the first screen owns IPC and
+  // the layout host so Quickshell does not warn about duplicate IpcHandler.
+  readonly property bool singletonOwner: {
+    var screens = Quickshell.screens
+    var mine = (root.screen && root.screen.name) ? String(root.screen.name) : ""
+    if (!screens || screens.length === 0)
+      return true
+    if (mine === "")
+      return true
+    return mine === String(screens[0].name)
+  }
+
   readonly property string miracastPluginDir: {
     var s = String(Qt.resolvedUrl("./"))
     if (s.indexOf("file://") === 0)
@@ -261,18 +273,24 @@ Panel {
 
   MonitorLayoutHost {
     id: layoutHost
+    singletonOwner: root.singletonOwner
   }
 
-  IpcHandler {
-    target: "realchrisolin.monitor"
+  Loader {
+    active: root.singletonOwner
+    sourceComponent: Component {
+      IpcHandler {
+        target: "realchrisolin.monitor"
 
-    function brightness(percent: string): string { return root.brightnessIpc(percent) }
-    function state(): string { return root.stateIpc() }
-    function open() { root.open() }
-    function close() { root.close() }
-    function toggle() { root.toggle() }
-    function show() { root.open() }
-    function hide() { root.close() }
+        function brightness(percent: string): string { return root.brightnessIpc(percent) }
+        function state(): string { return root.stateIpc() }
+        function open() { root.open() }
+        function close() { root.close() }
+        function toggle() { root.toggle() }
+        function show() { root.open() }
+        function hide() { root.close() }
+      }
+    }
   }
 
   function refresh() {

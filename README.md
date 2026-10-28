@@ -25,6 +25,7 @@ why upstream merges matter): see **[BUILD.md](BUILD.md)**.
 - Safer disconnect teardown (workspace migrate, cursor restore, eDP re-assert)
 - Optional VAAPI/QSV encode with OS power-plan throttling (FluxCast `power_plan_N`)
 - **Persist display across monitors** (default on): switching Miracast sinks keeps the same Extend desktop on a shared Hyprland output named `persistent-miracast`; off uses a peer-named head and seeds a fresh desktop. Empty leftover heads from earlier peer names are **not** destroyed (Hyprland `output remove` can freeze eDP); `miracast-ctl status` lists them as `orphanExtendHeads`. They clear on Hyprland restart.
+- **Start** disconnects a Wi-Fi STA already on **192.168.49.0/24** (WFD P2P subnet — phone hotspots often use it). Ethernet / docker / VPN on that range are logged and left up. **Stop** reaps leftover `fluxcast-dnsmasq` on old `p2p-wlp0s20-*` groups.
 
 ## Install
 
@@ -190,7 +191,7 @@ Override in `~/.config/omarchy-miracast/settings.json` (merged with
 | `vaapiRcMode` | *(from profile)* | `CQP` / `QVBR` / `CBR` / `VBR` → `FLUXCAST_WFD_VAAPI_RC`. |
 | `vaapiBitrate` | *(from profile)* | QVBR/CBR peak (`FLUXCAST_WFD_VAAPI_BITRATE`). |
 | `vaapiQp` | *(from profile)* | Quantizer (lower = sharper). |
-| `vaapiGop` | `15` at 1080p60 CBR | GOP frames. CBR interactive uses **15** (~0.25 s IDR at 60 fps). ABR `set-stream-mode` must not reset this to 60 (1 s IDR = 1 s lag). QVBR keeps ~1 s (`fps` frames). |
+| `vaapiGop` | `60` at 1080p60 | GOP frames (~1 s IDR). wf-recorder applies this on `AVCodecContext.gop_size` (`-p gop_size` is not a VAAPI private option). GOP 15 emptied a 0.25 s HRD four times a second. |
 | `vaapiAsyncDepth` | `2` | Pipe `async_depth` (from profile). |
 | `sinkScales` | `{}` | Per-sink Extend scale, keyed by MAC (overrides default) |
 | `defaultExtendScale` | `1` | Extend scale when a sink has no `sinkScales` entry — **1** is cheapest for Hyprland |
@@ -240,19 +241,19 @@ pill follows the resolved path (`capturePath` / `encoder` in status).
 
 Aligned with [Wi-Fi Display](https://www.wi-fi.org/system/files/Miracast_Specification_v2.3.pdf)
 §4.10.3 (adapt bitrate to the P2P link), [MS-WFDPE](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wfdpe/9ac9b0a4-0a94-483d-a8bf-cd7bfea99be0)
-interactive latency, and AOSP `Converter.cpp` (**CBR**, ~1 s IDR in stock AOSP;
-we use **GOP 15** at 60 fps for ~0.25 s IDR).
+interactive latency, and AOSP `Converter.cpp` (**CBR**, ~1 s IDR).
 
 | Knob | Interactive profile (kenya / hotyeah) | Why |
 |------|----------------------------------------|-----|
 | RC | **CBR** (`h264_vaapi`) | AOSP CBR. Intel QVBR undershoots (~0.2 Mbps) so a 3.5 Mbit VBV becomes seconds of lag. |
 | HRD | **0.25 s** of target (`bufsize ≈ bitrate/4`) | Intel low-delay AVC. 0.1 s pumped quality on iHD. |
-| GOP | **15** at 1080p60 | Shorter than AOSP’s 1 s IDR; ABR must not reset GOP to 60. |
+| GOP | **60** at 1080p60 | AOSP-style 1 s IDR. wf-recorder must set `AVCodecContext.gop_size` or Intel uses ~2 s. |
 | `i_qfactor` | **1.0** | IDR same quantizer as P (no “refresh” flash). |
 | AU delimiter | `aud=1` | Helps MPEG-TS access-unit framing. |
 | Mux | DMA encode + ffmpeg **copy**; **no `aresample=async`** | That filter held ~0.5 s. |
 | Audio | **LPCM `0x83`** if the sink lists LPCM; else AAC | WFD + AOSP LPCM PES. LPCM-only dongles ignore AAC. |
 | HEADLESS Hz | Match negotiated fps; clamp to advertised modes (**60** typical) | 30 Hz on a 60 Hz-only head stalls ICC. |
+| DMA freeze recovery | `encode stall` stderr (~4 s) + LPCM `wchar` IO watchdog (~8 s) | ICC DMA can stall after a window move; rchar stays flat so the watchdog watches wchar. |
 
 Layout: packer includes the Miracast tile. `positionsToLua` stages physical outputs **past** the virtual head, then moves `persistent-miracast`, then lands eDP — otherwise Hyprland warns **monitor layout overlaps**. `place-virtual-head` on **x,y-only** does not SIGUSR1 capture (`wf-recorder -o` follows the output name). Do not `miracast-ctl stop`/`start` to tweak encode (that modesets the virtual head; on kenya it has corrupted eDP). Use `restart-capture` or a user-requested reconnect.
 
