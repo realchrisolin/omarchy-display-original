@@ -321,6 +321,31 @@ def _station_dump_text(p2p_iface: Optional[str]) -> str:
         return ""
 
 
+def _as_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def should_probe_p2p_peer(data: dict[str, Any], prelim: Optional[dict[str, Any]] = None) -> bool:
+    """True only for a live cast / P2P link — not idle status polls.
+
+    Idle MiracastService polls ``status`` every ~5s and used to sudo
+    ``wpa_cli p2p_peer <lastPeerMac>`` forever after a drop. That is noise
+    when disconnected and kept Privileged Wi-Fi traffic alive during hangs.
+    """
+    if _as_bool(data.get("running")) or _as_bool(data.get("linkUp")):
+        return True
+    phase = str(data.get("phase") or "").strip().lower()
+    if phase in ("connecting", "dhcp", "rtsp", "streaming"):
+        return True
+    if prelim and prelim.get("p2pIface"):
+        return True
+    return False
+
+
 def _p2p_peer_text(peer_mac: Optional[str], sta_iface: Optional[str] = None) -> str:
     env = os.environ.get("MIRACAST_P2P_PEER_TEXT")
     if env is not None:
@@ -385,11 +410,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Need iw first so we know staIface for wpa_cli.
     prelim = merge_radio_fields(data, iw_text, station_text="", peer_text="")
     peer_mac = str(data.get("peer") or "").strip() or None
-    peer = (
-        args.peer_text
-        if args.peer_text is not None
-        else _p2p_peer_text(peer_mac, sta_iface=prelim.get("staIface"))
-    )
+    if args.peer_text is not None:
+        peer = args.peer_text
+    elif should_probe_p2p_peer(data, prelim) and peer_mac:
+        peer = _p2p_peer_text(peer_mac, sta_iface=prelim.get("staIface"))
+    else:
+        peer = ""
     merged = merge_radio_fields(data, iw_text, station_text="", peer_text=peer)
     station = (
         args.station_text

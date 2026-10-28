@@ -51,6 +51,13 @@ CAPTURE_PAUSED_FILE="$STATE_DIR/capture.paused"
 CAPTURE_ENCODE_FILE="$STATE_DIR/capture-encode"
 # Encode knobs for live SIGUSR1 restart (FluxCast reloads this into os.environ).
 ENCODE_ENV_FILE="$STATE_DIR/encode.env"
+# Unix epoch written at PLAY. restart-capture / SIGUSR1 is deferred while
+# (now - stamp) < PLAY_GRACE_S. LG webOS TEARDOWN'd after three rebinds in ~50s.
+PLAY_GRACE_FILE="$STATE_DIR/play.grace"
+PLAY_GRACE_S="${MIRACAST_PLAY_SIGUSR1_GRACE_S:-90}"
+# cmd_start owns the Extend head before PID_FILE exists. Status polls that
+# park here steal the layout to -12000 during handshake.
+CONNECTING_LOCK_FILE="$STATE_DIR/connecting.lock"
 # Previous Hyprland look/perf knobs while Miracast forced a light profile.
 CAST_HYPR_PERF_PREV_FILE="$STATE_DIR/cast-hypr-perf.prev"
 # Legacy filename from animations-only toggle.
@@ -62,6 +69,9 @@ CAST_ANIMATIONS_PREV_FILE="$STATE_DIR/cast-animations.prev"
 # i915 (no VT, caps-lock LED stuck). Keep software cursors for the whole
 # Extend lifetime, including a parked virtual head. Do not bounce
 # no_hardware_cursors across stop/start.
+# Same class of lock: do not force_renderer_reload / restart the shell /
+# focus-warp eDP against Hyprland while its VT is inactive, then switch
+# back (Ctrl+Alt+F1). See README § Virtual output lifecycle.
 hypr_cursor_no_hw_value() {
   timeout 2 hyprctl getoption cursor:no_hardware_cursors -j 2>/dev/null | python3 -c 'import json,sys
 try:
@@ -225,6 +235,38 @@ stamp_cast_log() {
   else
     awk '{ print strftime("%Y-%m-%dT%H:%M:%S%z"), $0; fflush() }'
   fi
+}
+
+# Fork + POSIX setsid so the child is not in `miracast-ctl start`'s process
+# group. Agent/terminal exit was SIGTERM-ing that group → `iw dev p2p-* del`.
+# Prints the new session-leader pid on stdout.
+fork_setsid() {
+  python3 -c '
+import os, sys
+argv = sys.argv[1:]
+child = os.fork()
+if child != 0:
+    sys.stdout.write(str(child) + "\n")
+    sys.stdout.flush()
+    os._exit(0)
+os.setsid()
+devnull = os.open("/dev/null", os.O_RDWR)
+os.dup2(devnull, 0)
+log = os.environ.get("MIRACAST_SETSID_LOG") or ""
+if log:
+    fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+else:
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+try:
+    os.close(devnull)
+except OSError:
+    pass
+os.execvp(argv[0], argv)
+' "$@"
 }
 LAT_FILE="$LOG_DIR/latency.jsonl"
 
@@ -1248,7 +1290,7 @@ PY
 # Zombies (defunct) count as dead — they fooled ensure after position moves.
 capture_senders_alive() {
   local tracked=""
-  [[ -f "$HEADLESS_FILE" ]] && tracked="$(cat "$HEADLESS_FILE" 2>/dev/null || true)"
+  tracked="$(tracked_extend_name)"
   python3 - "$tracked" <<'PY'
 import os, sys
 tracked = sys.argv[1]
@@ -1270,7 +1312,11 @@ for pid in os.listdir("/proc"):
         continue
     base = os.path.basename(cmd.split(" ", 1)[0]) if cmd else ""
     wf_match = "wf-recorder" in cmd and (
-        "HEADLESS" in cmd or (tracked and tracked in cmd)
+        "HEADLESS" in cmd
+        or "persistent-miracast" in cmd
+        or "Miracast" in cmd
+        or "h264_vaapi" in cmd
+        or (tracked and tracked in cmd)
     )
     ffmpeg_match = (
         (base in ("ffmpeg", "ffmpeg-") and "rtp_mpegts" in cmd)
@@ -1307,7 +1353,7 @@ capture_is_paused() {
 # Live fingerprint of the tracked Extend output: name|w|h|refresh|scale|x|y
 capture_output_fingerprint() {
   local tracked=""
-  [[ -f "$HEADLESS_FILE" ]] && tracked="$(cat "$HEADLESS_FILE" 2>/dev/null || true)"
+  tracked="$(tracked_extend_name)"
   [[ -n "$tracked" ]] || { echo ""; return 0; }
   hyprctl -j monitors 2>/dev/null | python3 -c '
 import json, sys
@@ -1363,12 +1409,64 @@ capture_geometry_drifted() {
   fi
 }
 
+# Tracked Extend output name: live headless file, else parked, else shared.
+tracked_extend_name() {
+  local n=""
+  if [[ -f "$HEADLESS_FILE" ]]; then
+    n="$(tr -d '\n' <"$HEADLESS_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -z "$n" && -f "$PARKED_FILE" ]]; then
+    n="$(tr -d '\n' <"$PARKED_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -z "$n" ]]; then
+    n="$SHARED_EXTEND_NAME"
+  fi
+  printf '%s' "$n"
+}
+
+mark_play_sigusr1_grace() {
+  mkdir -p "$STATE_DIR"
+  date +%s >"$PLAY_GRACE_FILE"
+}
+
+clear_play_sigusr1_grace() {
+  rm -f "$PLAY_GRACE_FILE"
+}
+
+# 0 while we are still inside the post-PLAY SIGUSR1 hold.
+in_play_sigusr1_grace() {
+  python3 - "$PLAY_GRACE_FILE" "${PLAY_GRACE_S:-90}" <<'PY'
+import sys, time
+from pathlib import Path
+p = Path(sys.argv[1])
+try:
+    window = float(sys.argv[2])
+except ValueError:
+    window = 90.0
+if window <= 0:
+    raise SystemExit(1)
+try:
+    started = float(p.read_text().strip().split()[0])
+except (OSError, ValueError, IndexError):
+    raise SystemExit(1)
+raise SystemExit(0 if (time.time() - started) < window else 1)
+PY
+}
+
 # SIGUSR1 FluxCast to rebuild wf-recorder/ffmpeg without dropping RTSP/P2P.
 # Prints: restarted=(true|false) healthy=(true|false) pid=...
 # Pass "quick" as $1 to signal without waiting for TX health (used by scale).
 restart_extend_capture() {
   local flux_pid capture_restarted=false capture_healthy=false
   local quick="${1:-}"
+  # LG webOS hangs up after stacked encode rebinds in the first minute.
+  # Hold every SIGUSR1 (ABR, ensure-capture, strategy apply) unless forced.
+  if [[ "${MIRACAST_FORCE_RESTART:-}" != "1" && "$quick" != "force" ]] && in_play_sigusr1_grace; then
+    flux_pid="$(fluxcast_pid || true)"
+    echo "[miracast-ctl] restart-capture deferred (PLAY SIGUSR1 grace ${PLAY_GRACE_S}s)" >>"$LOG_DIR/cast.log"
+    echo "restarted=false healthy=true pid=${flux_pid}"
+    return 0
+  fi
   # Mark capture paused for the UI watchdog so ensure-capture does not fire a
   # second SIGUSR1 mid-rebuild (double rebind → session death).
   printf '%s\n' "$(date -Iseconds 2>/dev/null || date)" >"$CAPTURE_PAUSED_FILE"
@@ -1616,6 +1714,88 @@ except Exception:
     needs_reconnect=true
   fi
   emit "{\"ok\":true,\"position\":\"$position\",\"applied\":true,\"captureRestarted\":$capture_restarted,\"captureHealthy\":$capture_healthy,\"needsReconnect\":$needs_reconnect,\"monitor\":\"$headless\",\"mode\":\"$mode\",\"pos\":\"$pos\",\"fluxPid\":\"$flux_pid\"}"
+}
+
+# Layout service calls this after a physical apply / Hyprland reload.
+# Idle heads stay parked; a live Extend session is placed beside eDP.
+# Handshake phases do not modeset. No-op when geometry already matches.
+place_virtual_head() {
+  local name=""
+  name="$(tracked_extend_name)"
+  [[ -n "$name" ]] || name="$SHARED_EXTEND_NAME"
+  if ! hypr_has_monitor "$name"; then
+    emit '{"ok":true,"applied":false,"reason":"no-head"}'
+    return 0
+  fi
+  local phase=""
+  phase="$(python3 -c 'import json
+from pathlib import Path
+p=Path.home()/".local/state/omarchy-miracast/status.json"
+try:
+    print(str(json.loads(p.read_text()).get("phase") or ""))
+except Exception:
+    print("")
+' 2>/dev/null || true)"
+
+  if connecting_lock_fresh && [[ "$phase" != "streaming" ]]; then
+    emit "{\"ok\":true,\"applied\":false,\"reason\":\"handshake\",\"monitor\":\"$name\"}"
+    return 0
+  fi
+  if [[ "$phase" == "connecting" || "$phase" == "dhcp" || "$phase" == "rtsp" ]]; then
+    emit "{\"ok\":true,\"applied\":false,\"reason\":\"handshake\",\"monitor\":\"$name\"}"
+    return 0
+  fi
+
+  if [[ "$phase" == "streaming" ]] || is_running || fluxcast_python_running; then
+    local position parts mode pos scale rest saved_scale peer_mac
+    position="$(extend_position)"
+    peer_mac="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("lastPeerMac") or "")
+except Exception: print("")
+' "$SETTINGS_FILE" 2>/dev/null || true)"
+    saved_scale="$(extend_scale_get "$peer_mac")"
+    parts="$(extend_geometry_parts "$position" "$saved_scale")"
+    mode="${parts%%|*}"
+    rest="${parts#*|}"
+    pos="${rest%%|*}"
+    scale="${rest#*|}"
+    [[ "$scale" == "$rest" || -z "$scale" ]] && scale="${saved_scale:-1}"
+    if python3 - "$name" "$pos" <<'PY'
+import json, sys
+name, want = sys.argv[1], sys.argv[2]
+wx, wy = want.split("x", 1)
+wx, wy = int(wx), int(wy)
+import subprocess
+raw = subprocess.check_output(["hyprctl", "-j", "monitors"], text=True, timeout=3)
+for m in json.loads(raw):
+    if str(m.get("name") or "") != name:
+        continue
+    raise SystemExit(0 if int(m.get("x") or 0) == wx and int(m.get("y") or 0) == wy else 1)
+raise SystemExit(1)
+PY
+    then
+      emit "{\"ok\":true,\"applied\":false,\"reason\":\"already-placed\",\"monitor\":\"$name\",\"pos\":\"$pos\"}"
+      return 0
+    fi
+    hypr_set_monitor_geometry "$name" "$mode" "$pos" "$scale" >/dev/null 2>&1 || true
+    if [[ "$phase" == "streaming" ]]; then
+      ensure_extend_capture_healthy 2 >/dev/null || true
+    fi
+    emit "{\"ok\":true,\"applied\":true,\"reason\":\"placed\",\"monitor\":\"$name\",\"pos\":\"$pos\"}"
+    return 0
+  fi
+
+  if extend_head_is_parked "$name"; then
+    emit "{\"ok\":true,\"applied\":false,\"reason\":\"already-parked\",\"monitor\":\"$name\"}"
+    return 0
+  fi
+  park_extend_head_offlayout "$name" || true
+  printf '%s\n' "$name" >"$PARKED_FILE"
+  emit "{\"ok\":true,\"applied\":true,\"reason\":\"parked\",\"monitor\":\"$name\"}"
+}
+
+cmd_place_virtual_head() {
+  place_virtual_head
 }
 
 ensure_extend_monitor() {
@@ -2043,7 +2223,7 @@ for m in ms:
     if str(m.get("name") or "") != primary:
         continue
     aw = m.get("activeWorkspace") or {}
-    name = str(aw.get("name") or aw.get("id") or "1")
+    name = str(aw.get("name") or aw.get("id") or aw.get("address") or "1")
     if name.startswith("special:") or name.startswith("ext-") or name.startswith("name:"):
         name = "1"
     print(name)
@@ -2091,7 +2271,8 @@ for ws in spaces:
     if int(ws.get("windows") or 0) <= 0:
         continue
     name = str(ws.get("name") or "")
-    wid = ws.get("id")
+    # Hyprland 0.56 workspace JSON dropped "id"; "address" is the replacement.
+    wid = ws.get("id") or ws.get("address")
     # Named ext-* need the name: prefix for Lua dispatch.
     if name.startswith("ext-"):
         target = f"name:{name}"
@@ -2295,8 +2476,13 @@ kms_settle() {
 unpark_usb_extend_if_grouped() {
   [[ -f "$PARKED_FILE" ]] || return 0
   local name=""
-  name="$(tr -d '\n' <"$HEADLESS_FILE" 2>/dev/null || true)"
-  [[ -n "$name" ]] || name="$(tr -d '\n' <"$PARKED_FILE" 2>/dev/null || true)"
+  if [[ -f "$HEADLESS_FILE" ]]; then
+    name="$(tr -d '\n' <"$HEADLESS_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -z "$name" && -f "$PARKED_FILE" ]]; then
+    name="$(tr -d '\n' <"$PARKED_FILE" 2>/dev/null || true)"
+  fi
+  [[ -n "$name" ]] || name="$SHARED_EXTEND_NAME"
   [[ -n "$name" ]] || return 0
   hypr_has_monitor "$name" || return 0
   p2p_group_up || return 0
@@ -2313,10 +2499,14 @@ try:
 except OSError:
     raise SystemExit(1)
 p = Path("/tmp/fluxcast-usb-wpa/wpa.log")
+if not p.is_file():
+    # AX201 / system wpa: no dedicated USB log. p2p_group_up already
+    # passed; allow unpark so the Extend head leaves -12000x0.
+    raise SystemExit(0)
 try:
     lines = p.read_text(errors="replace").splitlines()
 except OSError:
-    raise SystemExit(1)
+    raise SystemExit(0)
 last_start = -1.0
 last_fail = -1.0
 for line in lines:
@@ -2358,6 +2548,7 @@ PY
   # Do not leave keyboard/pointer on the virtual head (invisible cursor on
   # eDP, binds appear dead). seed already activates ext-1 then returns.
   force_seat_to_primary || true
+  printf '%s\n' "$name" >"$HEADLESS_FILE"
   rm -f "$PARKED_FILE"
   disconnect_log "unparked USB extend $name on-layout"
   load_icc_present_kick || true
@@ -4099,10 +4290,11 @@ except Exception:
     data["encodeProfile"] = "medium"
     data["encodeProfileEffective"] = "medium"
 # Only surface resolved path while a cast is live — stale latency.jsonl must
-# not light the wrong RENDER ENGINE pill when idle.
-live = bool(data.get("running")) or str(data.get("phase") or "") in (
-    "connecting", "dhcp", "rtsp", "streaming",
-)
+# not light the wrong RENDER ENGINE pill when idle. connecting + running=false
+# is a dead pid left in status.json; do not treat that as live.
+_running = data.get("running") in (True, "true", "1", "yes", 1)
+_phase = str(data.get("phase") or "")
+live = _running or _phase in ("dhcp", "rtsp", "streaming")
 if live:
     capture_path = data.get("capturePath")
     encoder = data.get("encoder")
@@ -4464,20 +4656,97 @@ is_running() {
   kill -0 "$pid" 2>/dev/null
 }
 
+connecting_lock_fresh() {
+  python3 - "$CONNECTING_LOCK_FILE" <<'PY'
+import sys, time
+from pathlib import Path
+p = Path(sys.argv[1])
+try:
+    age = time.time() - p.stat().st_mtime
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0 if age < 180.0 else 1)
+PY
+}
+
+persist_idle_if_cast_pid_dead() {
+  # status.json can keep running=true / phase=connecting after python exits.
+  # The dropdown then looks busy (Stop instead of Reconnect). Persist idle
+  # (or running=false while a leftover GO is still up) when both the wrapper
+  # pid and FluxCast python are gone.
+  if connecting_lock_fresh; then
+    return 0
+  fi
+  local wrap=""
+  [[ -f "$PID_FILE" ]] && wrap="$(tr -d '[:space:]' <"$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "$wrap" ]] && kill -0 "$wrap" 2>/dev/null; then
+    return 0
+  fi
+  if fluxcast_python_running; then
+    return 0
+  fi
+  rm -f "$PID_FILE"
+  [[ -f "$STATUS_FILE" ]] || return 0
+  local link_up="false"
+  if p2p_group_up; then link_up="true"; fi
+  python3 - "$STATUS_FILE" "$link_up" <<'PY'
+import json, os, sys, time
+path, link_up = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(path))
+except Exception:
+    raise SystemExit(0)
+if not isinstance(data, dict):
+    raise SystemExit(0)
+phase = str(data.get("phase") or "")
+running = data.get("running") in (True, "true", "1", "yes", 1)
+stale_phase = phase in ("connecting", "dhcp", "rtsp", "streaming", "scanning")
+pid = str(data.get("pid") or "").strip()
+if pid.isdigit():
+    try:
+        os.kill(int(pid), 0)
+    except OSError:
+        pass
+    else:
+        raise SystemExit(0)
+if not running and not stale_phase:
+    raise SystemExit(0)
+out = {k: data[k] for k in ("peer", "peerName", "mode") if data.get(k)}
+out["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+out["running"] = False
+out["pid"] = None
+if link_up == "true":
+    if phase not in ("dhcp", "rtsp", "streaming"):
+        phase = "dhcp"
+        data["message"] = "P2P up; waiting for sink IP / RTSP"
+    out["phase"] = phase
+    out["message"] = data.get("message") or "P2P up; waiting for sink IP / RTSP"
+else:
+    out["phase"] = "idle"
+    out["message"] = "Idle"
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(out, f, separators=(",", ":"))
+    f.write("\n")
+PY
+}
+
 p2p_group_up() {
   # True when a real P2P group exists (NM p2p-wlp* or dedicated-wpa p2p-N),
   # not p2p-dev-* and not a pending GO shell (type P2P-GO with no SSID).
+  # P2P-client often omits ssid in `iw dev`; association is still live.
   if iw dev 2>/dev/null | awk '
     $1 == "Interface" {
       if (iface != "" && ok) { found=1 }
-      iface=$2; ssid=0; p2p=0; skip=0
+      iface=$2; ssid=0; go=0; client=0; skip=0
       if ($2 ~ /^p2p-dev-/) skip=1
       next
     }
     skip { next }
     $1 == "ssid" { ssid=1 }
-    $1 == "type" && ($2 == "P2P-GO" || $2 == "P2P-client") { p2p=1 }
-    iface != "" && p2p && ssid { ok=1 }
+    $1 == "type" && $2 == "P2P-GO" { go=1 }
+    $1 == "type" && $2 == "P2P-client" { client=1 }
+    iface != "" && client { ok=1 }
+    iface != "" && go && ssid { ok=1 }
     END { if (iface != "" && ok) found=1; exit found ? 0 : 1 }
   '; then
     return 0
@@ -4512,23 +4781,18 @@ reconcile_stale_cast() {
   # Only reclaim wedged sessions AFTER media is playing. Earlier phases
   # (connecting/dhcp/rtsp) often flap the P2P iface during DHCP/RTSP setup;
   # killing there caused silent reconnect failures mid-handshake.
+  # Do not sleep or cmd_stop while FluxCast python is still running:
+  # panel status polls every 2s, and a false-empty `iw station`/ssid on
+  # P2P-client used to stop a live PLAY ~6s in (twice).
   is_running || return 0
   local phase=""
   if [[ -f "$STATUS_FILE" ]]; then
     phase="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("phase",""))' "$STATUS_FILE" 2>/dev/null || true)"
   fi
   [[ "$phase" == "streaming" ]] || return 0
-  if p2p_group_up; then
-    return 0
-  fi
-  # Sustained grace: require the group to stay down across several checks.
-  local i
-  for i in 1 2 3 4 5; do
-    sleep 1
-    if p2p_group_up; then
-      return 0
-    fi
-  done
+  connecting_lock_fresh && return 0
+  fluxcast_python_running && return 0
+  p2p_group_up && return 0
   cmd_stop >/dev/null || true
   write_status "error" "Miracast link dropped after streaming started" >/dev/null || true
 }
@@ -4680,6 +4944,130 @@ reconcile_zombie_media() {
   esac
 }
 
+# True when hyprctl monitors JSON is reachable (do not clear tracking on IPC fail).
+hypr_monitors_reachable() {
+  timeout 2 hyprctl -j monitors >/dev/null 2>&1
+}
+
+# True when named monitor is already at the off-layout park position.
+extend_head_is_parked() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || return 1
+  timeout 2 hyprctl -j monitors 2>/dev/null | python3 -c '
+import json,sys
+want=sys.argv[1]
+try:
+    ms=json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+for m in ms:
+    if str(m.get("name") or "") != want:
+        continue
+    x=int(m.get("x") if m.get("x") is not None else -1)
+    y=int(m.get("y") if m.get("y") is not None else -1)
+    # PARKED_EXTEND_POS=-12000x0
+    raise SystemExit(0 if x == -12000 and y == 0 else 1)
+raise SystemExit(1)
+' "$name" 2>/dev/null
+}
+
+# When no sink/P2P/FluxCast is live: persist idle (incl. stale error), drop
+# parked-tracking files if Hyprland no longer has the head, re-park an
+# on-layout idle Extend head (never destroy), restore HW cursors only when
+# no virtual head remains, and reap leftover watchers.
+reconcile_disconnected_session() {
+  is_running && return 0
+  fluxcast_python_running && return 0
+  p2p_group_up && return 0
+  # cmd_start writes HEADLESS_FILE and places the head before PID_FILE.
+  # Panel status polls used to re-park to -12000 in that window.
+  connecting_lock_fresh && return 0
+  [[ -f "$HEADLESS_FILE" ]] && return 0
+
+  # Persist idle over stale error / leftover active phases (status.json can
+  # keep "Miracast link dropped…" for weeks while the bar still looks live).
+  if [[ -f "$STATUS_FILE" ]]; then
+    python3 - "$STATUS_FILE" <<'PY'
+import json, sys, time
+path = sys.argv[1]
+try:
+    data = json.load(open(path))
+except Exception:
+    raise SystemExit(0)
+if not isinstance(data, dict):
+    raise SystemExit(0)
+phase = str(data.get("phase") or "")
+running = data.get("running") in (True, "true", "1", "yes", 1)
+if running:
+    raise SystemExit(0)
+if phase not in ("error", "connecting", "dhcp", "rtsp", "streaming", "scanning"):
+    raise SystemExit(0)
+out = {k: data[k] for k in ("peer", "peerName", "mode") if data.get(k)}
+out["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+out["running"] = False
+out["pid"] = None
+out["phase"] = "idle"
+out["message"] = "Idle"
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(out, f, separators=(",", ":"))
+    f.write("\n")
+PY
+  fi
+
+  # Watchers should not outlive a disconnected session.
+  stop_miracast_link_watcher >/dev/null 2>&1 || true
+  stop_miracast_health_watcher >/dev/null 2>&1 || true
+  stop_miracast_audio_route_watcher >/dev/null 2>&1 || true
+  reap_orphan_link_watchers "" >/dev/null 2>&1 || true
+  reap_orphaned_audio_route_watchers "" >/dev/null 2>&1 || true
+
+  # Hyprland IPC down → leave tracking alone (avoid false "head gone").
+  if ! hypr_monitors_reachable; then
+    return 0
+  fi
+
+  local name=""
+  if [[ -f "$PARKED_FILE" ]]; then
+    name="$(tr -d '\n' <"$PARKED_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -z "$name" && -f "$HEADLESS_FILE" ]]; then
+    name="$(tr -d '\n' <"$HEADLESS_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -z "$name" ]] && hypr_has_monitor "$SHARED_EXTEND_NAME"; then
+    name="$SHARED_EXTEND_NAME"
+  fi
+
+  if [[ -n "$name" ]] && hypr_has_monitor "$name"; then
+    # Head still present with no sink: keep it (eDP safety) but ensure it is
+    # off-layout so idle sessions do not leave an on-layout Extend desktop.
+    if ! extend_head_is_parked "$name"; then
+      disconnect_log "disconnected reconcile: re-park idle head $name off-layout"
+      force_seat_to_primary || true
+      park_extend_head_offlayout "$name" || true
+      printf '%s\n' "$name" >"$PARKED_FILE"
+      rm -f "$HEADLESS_FILE" "$CAPTURE_GEOM_FILE"
+      force_seat_to_primary || true
+    else
+      printf '%s\n' "$name" >"$PARKED_FILE"
+      rm -f "$HEADLESS_FILE" "$CAPTURE_GEOM_FILE"
+    fi
+    # Virtual head remains → keep software cursors.
+    restore_software_cursors || true
+    unload_icc_present_kick || true
+    return 0
+  fi
+
+  # Named head gone (typical after Hyprland restart): drop stale tracking so
+  # the next Extend creates fresh and HW cursors can restore.
+  if [[ -f "$PARKED_FILE" || -f "$HEADLESS_FILE" ]]; then
+    disconnect_log "disconnected reconcile: clear stale parked/headless tracking (no Hyprland head)"
+  fi
+  rm -f "$PARKED_FILE" "$HEADLESS_FILE" "$CAPTURE_GEOM_FILE" \
+    "$STATE_DIR/pending-remove.name" "$STATE_DIR/pending-remove.primary"
+  restore_software_cursors || true
+  unload_icc_present_kick || true
+}
+
 enrich_peer_name() {
   # Read JSON status from stdin; script via -c so stdin stays the pipe.
   python3 -c '
@@ -4729,8 +5117,10 @@ print(json.dumps(data, separators=(",", ":")))
 }
 
 cmd_status() {
+  persist_idle_if_cast_pid_dead || true
   reconcile_stale_cast || true
   reconcile_zombie_media || true
+  reconcile_disconnected_session || true
   local settings link_up="false"
   settings="$(read_settings)"
   if p2p_group_up; then link_up="true"; fi
@@ -4799,14 +5189,17 @@ except Exception:
     settings = {}
 # FluxCast python may have died while the USB GO is still up (LG still
 # shows kenya connected). Do not force idle — the dropdown uses phase.
+# When the link is down, clear connecting/streaming *and* stale error so the
+# bar does not keep "link dropped" forever after a dead sink.
 if link_up == "true":
     if data.get("phase") not in ("dhcp", "rtsp", "streaming"):
         data["phase"] = "dhcp"
     data["message"] = data.get("message") or "P2P up; waiting for sink IP / RTSP"
-elif data.get("phase") not in ("error",):
-    if data.get("phase") in ("connecting", "dhcp", "rtsp", "streaming", "scanning"):
-        data["phase"] = "idle"
-        data["message"] = "Idle"
+elif data.get("phase") in (
+    "connecting", "dhcp", "rtsp", "streaming", "scanning", "error",
+):
+    data["phase"] = "idle"
+    data["message"] = "Idle"
 data["running"] = False
 data["pid"] = None
 data["linkUp"] = link_up == "true"
@@ -5519,7 +5912,8 @@ start_miracast_link_watcher() {
     return 1
   }
   # Cheap TX poll; rare cached nmcli score; CSA only with cooldown/hysteresis.
-  nohup python3 "$script" \
+  local lwpid
+  lwpid="$(MIRACAST_SETSID_LOG="$LOG_DIR/link-watch.log" fork_setsid python3 "$script" \
     --ctl "$PLUGIN_DIR/bin/miracast-ctl" \
     --plugin "$PLUGIN_DIR" \
     --status "$STATUS_FILE" \
@@ -5532,10 +5926,9 @@ start_miracast_link_watcher() {
     --score-cooldown 180 \
     --csa-cooldown 300 \
     --csa-max-per-hour 2 \
-    --video-signal-cooldown 90 \
-    >>"$LOG_DIR/link-watch.log" 2>&1 &
-  echo $! >"$LINK_WATCH_PID_FILE"
-  echo "[miracast-ctl] link watcher pid=$!" >>"$LOG_DIR/cast.log"
+    --video-signal-cooldown 90)"
+  echo "$lwpid" >"$LINK_WATCH_PID_FILE"
+  echo "[miracast-ctl] link watcher pid=$lwpid (setsid)" >>"$LOG_DIR/cast.log"
 }
 
 stop_miracast_link_watcher() {
@@ -5629,6 +6022,7 @@ cmd_stop() {
       *) shift ;;
     esac
   done
+  persist_idle_if_cast_pid_dead || true
   disconnect_log "cmd_stop begin keep_workspaces=$keep_workspaces"
   # Stop helpers first so they cannot restart-capture / respawn during teardown.
   stop_miracast_link_watcher || true
@@ -5698,7 +6092,12 @@ if not keep:
         if pid:
             run(["kill", str(pid)])
 PY
-  rm -f "$HEALTH_WATCH_PID_FILE"
+  rm -f "$HEALTH_WATCH_PID_FILE" "$PLAY_GRACE_FILE"
+  # keep_workspaces=1 is cmd_start's internal previous-session stop; the
+  # connecting lock must survive until this new start writes PID_FILE.
+  if [[ "$keep_workspaces" != "1" ]]; then
+    rm -f "$CONNECTING_LOCK_FILE"
+  fi
   # Best-effort cleanup of FluxCast / capture leftovers without self-matching kill
   python3 - "$HEADLESS_FILE" <<'PY'
 import os, signal, time, sys
@@ -5784,6 +6183,534 @@ PY
   write_status "idle" "Stopped" "mode=$mode" "peerName=$peer_name"
 }
 
+cmd_cast_pipeline() {
+  # Detached FluxCast session (setsid). Locals come from cast-pipeline.env.
+  # shellcheck disable=SC1090
+  source "$STATE_DIR/cast-pipeline.env"
+    cd "$root"
+    export PYTHONUNBUFFERED=1
+    export PATH="/usr/bin:/bin:$PATH"
+    export FLUXCAST_WFD_ENCODE_ENV_FILE="$ENCODE_ENV_FILE"
+    export FLUXCAST_MIRACAST_CTL="$PLUGIN_DIR/bin/miracast-ctl"
+    export FLUXCAST_WFD_ENCODER="$video_encoder"
+    export FLUXCAST_WFD_CAPTURE_ENCODE_FILE="$CAPTURE_ENCODE_FILE"
+    export FLUXCAST_WFD_CAPTURE_ENCODE_PREF="$capture_encode"
+    # Legacy CAPTURE_ENCODE still set for older FluxCast checkouts.
+    case "$capture_encode" in
+      dmabuf) export FLUXCAST_WFD_CAPTURE_ENCODE=vaapi ;;
+      vaapi) export FLUXCAST_WFD_CAPTURE_ENCODE=pipe ;;
+      cpu) export FLUXCAST_WFD_CAPTURE_ENCODE=pipe ;;
+    esac
+    # Smart View + DMA-BUF: keep retrying DMA across SIGUSR1 encode rebinds.
+    _strat="$(python3 -c 'import json,sys; print(str(json.loads(sys.argv[1]).get("encodeStrategy") or "smartview").lower())' "$settings" 2>/dev/null || echo smartview)"
+    if [[ "$_strat" == "smartview" && "$capture_encode" == "dmabuf" ]]; then
+      export FLUXCAST_WFD_DMABUF_STICKY=1
+      echo "[miracast-ctl] DMA-BUF sticky=on (QVBR strategy)" >>"$LOG_DIR/cast.log"
+    else
+      export FLUXCAST_WFD_DMABUF_STICKY=0
+    fi
+    # Scaled outputs use DMA-BUF by default (proven at integer scale 2 with
+    # tv-range CQP). Deny with FLUXCAST_WFD_DMABUF_ALLOW_SCALED=0 if needed.
+    export FLUXCAST_WFD_DMABUF_ALLOW_SCALED="${FLUXCAST_WFD_DMABUF_ALLOW_SCALED:-}"
+    # Prefer damage-aware capture (omit wf-recorder -D). Precedence:
+    # FLUXCAST_WFD_WF_RECORDER_DAMAGE env → settings.wfRecorderDamage → "1".
+    # Force continuous with DAMAGE=0 / wfRecorderDamage=0.
+    _dmg="$(python3 -c 'import json,sys; s=json.loads(sys.argv[1]); print(str(s.get("wfRecorderDamage","1")).strip() or "1")' "$settings" 2>/dev/null || echo 1)"
+    _dmg="${FLUXCAST_WFD_WF_RECORDER_DAMAGE:-$_dmg}"
+    if [[ "$_dmg" =~ ^(0|false|no|off)$ ]]; then
+      unset FLUXCAST_WFD_WF_RECORDER_DAMAGE
+      echo "[miracast-ctl] wf-recorder damage-aware=off (continuous -D)" >>"$LOG_DIR/cast.log"
+    else
+      export FLUXCAST_WFD_WF_RECORDER_DAMAGE=1
+      echo "[miracast-ctl] wf-recorder damage-aware=on (omit -D)" >>"$LOG_DIR/cast.log"
+    fi
+
+    # DMA CQP quantizer: settings.vaapiQp (default 18). `$settings` is JSON text
+    # from read_settings, not a path. Settings win over a stale env value.
+    _qp="$(python3 -c 'import json,sys
+s=json.loads(sys.argv[1])
+v=s.get("vaapiQp", None)
+if v is not None and str(v).strip()!="":
+  print(str(v).strip())
+else:
+  print((sys.argv[2] if len(sys.argv)>2 else "") or "18")
+' "$settings" "${FLUXCAST_WFD_VAAPI_QP:-}" 2>/dev/null || echo "${FLUXCAST_WFD_VAAPI_QP:-18}")"
+    export FLUXCAST_WFD_VAAPI_QP="$_qp"
+    echo "[miracast-ctl] VAAPI QP=$FLUXCAST_WFD_VAAPI_QP" >>"$LOG_DIR/cast.log"
+    # GOP frames: settings.vaapiGop → env → 60 (1s at 1080p60).
+    _gop="$(python3 -c 'import json,sys
+s=json.loads(sys.argv[1])
+v=s.get("vaapiGop", None)
+if v is not None and str(v).strip()!="":
+  print(str(v).strip())
+else:
+  print((sys.argv[2] if len(sys.argv)>2 else "") or "60")
+' "$settings" "${FLUXCAST_WFD_VAAPI_GOP:-}" 2>/dev/null || echo "${FLUXCAST_WFD_VAAPI_GOP:-60}")"
+    export FLUXCAST_WFD_VAAPI_GOP="$_gop"
+    echo "[miracast-ctl] VAAPI GOP=$FLUXCAST_WFD_VAAPI_GOP" >>"$LOG_DIR/cast.log"
+    # Rate control: settings.vaapiRcMode (CQP|QVBR|CBR|VBR) + bitrate for non-CQP.
+    _rc="$(python3 -c 'import json,sys
+s=json.loads(sys.argv[1])
+print(str(s.get("vaapiRcMode") or "CQP").strip().upper() or "CQP")
+' "$settings" 2>/dev/null || echo CQP)"
+    export FLUXCAST_WFD_VAAPI_RC="$_rc"
+    _br="$(python3 -c 'import json,sys
+s=json.loads(sys.argv[1])
+print(str(s.get("vaapiBitrate") or "12M").strip() or "12M")
+' "$settings" 2>/dev/null || echo 12M)"
+    export FLUXCAST_WFD_VAAPI_BITRATE="$_br"
+    # Settings default; pre-set FLUXCAST_WFD_VAAPI_QUALITY wins (A/B tests).
+    # Default 5: pipe A/B — q2 choppier; q7+tight VBV stalled.
+    _qual="$(python3 -c 'import json,sys
+s=json.loads(sys.argv[1])
+print(str(s.get("vaapiQuality") or "5").strip() or "5")
+' "$settings" 2>/dev/null || echo 5)"
+    _qual="${FLUXCAST_WFD_VAAPI_QUALITY:-$_qual}"
+    export FLUXCAST_WFD_VAAPI_QUALITY="$_qual"
+    _async="$(python3 -c 'import json,sys
+s=json.loads(sys.argv[1])
+print(str(s.get("vaapiAsyncDepth") or "2").strip() or "2")
+' "$settings" 2>/dev/null || echo 2)"
+    _async="${FLUXCAST_WFD_VAAPI_ASYNC_DEPTH:-$_async}"
+    # Pipe VAAPI: quality<4 or async>1 hung on-device (bufs_size → audio-only).
+    _ce="$(python3 -c 'import json,sys
+s=json.loads(sys.argv[1])
+print(str(s.get("captureEncode") or "").strip().lower())
+' "$settings" 2>/dev/null || echo "")"
+    if [[ "$_ce" == "vaapi" || "$_ce" == "cpu" || "${FLUXCAST_WFD_CAPTURE_ENCODE_PREF:-}" == "vaapi" ]]; then
+      if [[ -z "${FLUXCAST_WFD_VAAPI_PIPE_UNSAFE:-}" ]]; then
+        # quality=1 hung the pipe; allow 3+ for sharper CBR on hard scenes.
+        if [[ "${_qual:-4}" =~ ^[0-9]+$ ]] && (( _qual < 3 )); then
+          echo "[miracast-ctl] clamp pipe VAAPI quality $_qual→3" >>"$LOG_DIR/cast.log"
+          _qual=3
+          export FLUXCAST_WFD_VAAPI_QUALITY="$_qual"
+        fi
+        if [[ "${_async:-1}" =~ ^[0-9]+$ ]] && (( _async > 1 )); then
+          echo "[miracast-ctl] clamp pipe VAAPI async $_async→1" >>"$LOG_DIR/cast.log"
+          _async=1
+        fi
+      fi
+    fi
+    export FLUXCAST_WFD_VAAPI_ASYNC_DEPTH="$_async"
+    _iqf="$(python3 -c 'import json,sys
+s=json.loads(sys.argv[1])
+print(str(s.get("vaapiIQfactor") or "").strip())
+' "$settings" 2>/dev/null || echo "")"
+    if [[ -n "$_iqf" ]]; then
+      export FLUXCAST_WFD_VAAPI_I_QFACTOR="$_iqf"
+    else
+      unset FLUXCAST_WFD_VAAPI_I_QFACTOR 2>/dev/null || true
+    fi
+    echo "[miracast-ctl] VAAPI RC=$FLUXCAST_WFD_VAAPI_RC bitrate=$FLUXCAST_WFD_VAAPI_BITRATE quality=$FLUXCAST_WFD_VAAPI_QUALITY async=$_async i_qfactor=${FLUXCAST_WFD_VAAPI_I_QFACTOR:-none} profile=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1]).get("encodeProfile","medium"))' "$settings" 2>/dev/null || echo medium) content=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1]).get("castPreset","desktop"))' "$settings" 2>/dev/null || echo desktop)" >>"$LOG_DIR/cast.log"
+    # QVBR: honor settings vbvMultiplier (default 2.0). CQP stays latency-first.
+    _air=""
+    _air="$(iw dev p2p-0 station dump 2>/dev/null | awk '/expected throughput/{gsub(/Mbps/,""); print $3; exit}')" || true
+    if [[ -n "$_air" ]]; then
+      export FLUXCAST_WFD_AIR_MBPS="$_air"
+    fi
+    _vbv="$(PYTHONPATH="$PLUGIN_DIR/scripts${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
+import json, sys
+from encode_strategy import QVBR_VBV_MULTIPLIER, latency_first_vbv_multiplier, bitrate_to_mbps, normalize_strategy
+s = json.loads(sys.argv[1])
+strat = normalize_strategy(s.get("encodeStrategy"))
+rc = str(s.get("vaapiRcMode") or "").strip().upper()
+if strat == "smartview" or rc == "QVBR":
+    raw = str(s.get("vbvMultiplier") or "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = QVBR_VBV_MULTIPLIER
+    if v < 1.0:
+        v = QVBR_VBV_MULTIPLIER
+    print("%g" % max(1.0, min(4.0, v)))
+else:
+    enc = bitrate_to_mbps(s.get("vaapiBitrate") or s.get("bitrate") or "2.4M")
+    print("%g" % latency_first_vbv_multiplier(enc, None))
+' "$settings" 2>/dev/null || echo 2.0)"
+    _vbv="${FLUXCAST_WFD_VBV_MULTIPLIER:-$_vbv}"
+    export FLUXCAST_WFD_VBV_MULTIPLIER="$_vbv"
+    unset FLUXCAST_WFD_VAAPI_PIPE_LOW_LATENCY 2>/dev/null || true
+    echo "[miracast-ctl] VBV_MULTIPLIER=$FLUXCAST_WFD_VBV_MULTIPLIER air=${FLUXCAST_WFD_AIR_MBPS:-unknown} (QVBR HRD)" >>"$LOG_DIR/cast.log"
+    # Optional ICC / custom wf-recorder: env or settings.wfRecorderBin only
+    # (see resolve_wf_recorder_env). Default = PATH stock binary.
+    local _wf_env _wf_bin _wf_proto
+    _wf_env="$(resolve_wf_recorder_env 2>>"$LOG_DIR/cast.log")"
+    eval "$_wf_env"
+    _wf_bin="${WF_RECORDER_BIN:-}"
+    _wf_proto="${WF_RECORDER_PROTO:-auto}"
+    if [[ -n "$_wf_bin" ]]; then
+      export FLUXCAST_WFD_WF_RECORDER_BIN="$_wf_bin"
+      export FLUXCAST_WFD_WF_RECORDER_PROTO="$_wf_proto"
+      # ICC: skip painting the HW cursor plane into capture (reduces ghosts when
+      # the pointer leaves the Miracast head). SW cursors still appear if enabled.
+      export WF_RECORDER_NO_PAINT_CURSORS="${WF_RECORDER_NO_PAINT_CURSORS:-1}"
+      echo "[miracast-ctl] wf-recorder BIN=$_wf_bin PROTO=$_wf_proto NO_PAINT_CURSORS=$WF_RECORDER_NO_PAINT_CURSORS" >>"$LOG_DIR/cast.log"
+      # Do not load ICC during USB GO Neg (KMS). Health watcher loads it at unpark.
+    else
+      unset FLUXCAST_WFD_WF_RECORDER_BIN FLUXCAST_WFD_WF_RECORDER_PROTO 2>/dev/null || true
+      echo "[miracast-ctl] wf-recorder using PATH (stock default)" >>"$LOG_DIR/cast.log"
+      unload_icc_present_kick
+    fi
+    export FLUXCAST_WFD_MODE_STATE="$MODE_STATE_FILE"
+    # Default: RTSP picks the sink's best progressive CEA/VESA mode (pixel-rate).
+    # Set FLUXCAST_WFD_MODE_POLICY=match_settings to honor streamMode/fps instead.
+    export FLUXCAST_WFD_MODE_POLICY="${FLUXCAST_WFD_MODE_POLICY:-best_advertised}"
+    # When set (file exists), FluxCast must not auto-rebind over an intentional
+    # pause (screen lock / Extend position move).
+    export FLUXCAST_CAPTURE_PAUSE_FILE="$CAPTURE_PAUSED_FILE"
+    clear_capture_paused
+    local wifi_iface="" wfd_iface_args=() go_5ghz_args=()
+    wifi_iface="$(resolve_p2p_wifi_iface)"
+    if [[ -n "$wifi_iface" ]]; then
+      wfd_iface_args=(--wfd-interface "$wifi_iface")
+      export FLUXCAST_WFD_INTERFACE="$wifi_iface"
+      echo "[miracast-ctl] P2P Wi-Fi iface=$wifi_iface" >>"$LOG_DIR/cast.log"
+      if is_usb_wifi_iface "$wifi_iface"; then
+        # GO intent is a phy decision (1-stream SoftMAC stays GO). Do not
+        # force 15 for every USB adapter.
+        # Pass peer listen MHz from last scan so USB PD/Neg hits that channel.
+        local _listen_mhz=""
+        _listen_mhz="$(python3 -c 'import json,sys
+mac=sys.argv[1].replace("-",":").upper()
+try:
+  rows=json.load(open(sys.argv[2]))
+except Exception:
+  rows=[]
+for p in rows:
+  if str(p.get("mac") or "").replace("-",":").upper()!=mac:
+    continue
+  for k in ("listenFreqMHz","operFreqMHz"):
+    v=p.get(k)
+    if v in (None,"",0,"0"):
+      continue
+    try:
+      n=int(v)
+    except Exception:
+      continue
+    if n>0:
+      print(n); raise SystemExit
+' "$peer" "$PEERS_FILE" 2>/dev/null || true)"
+        if [[ -n "$_listen_mhz" ]]; then
+          export FLUXCAST_PEER_LISTEN_MHZ="$_listen_mhz"
+          echo "[miracast-ctl] USB P2P: peer listen ${_listen_mhz} MHz from scan cache" >>"$LOG_DIR/cast.log"
+        else
+          unset FLUXCAST_PEER_LISTEN_MHZ 2>/dev/null || true
+        fi
+        local _go_5ghz=0
+        _go_5ghz="$(python3 -c 'import json,sys
+s=json.loads(sys.argv[1])
+v=s.get("p2pGo5GHz", False)
+print("1" if v in (True,1,"1","true","yes","on") else "0")
+' "$settings" 2>/dev/null || echo 0)"
+        if [[ "${FLUXCAST_WFD_GO_5GHZ:-}" =~ ^(1|true|yes|on)$ ]]; then
+          _go_5ghz=1
+        fi
+        if [[ "$_go_5ghz" == "1" ]]; then
+          go_5ghz_args=(--wfd-go-5ghz)
+          echo "[miracast-ctl] P2P: prefer 5 GHz GO (--wfd-go-5ghz)" >>"$LOG_DIR/cast.log"
+        else
+          echo "[miracast-ctl] P2P: GO channel from phy ∩ peer (p2pGo5GHz=true to prefer 5 GHz)" >>"$LOG_DIR/cast.log"
+        fi
+      fi
+    fi
+    export FLUXCAST_LIST_P2P_RADIOS="$PLUGIN_DIR/scripts/list_p2p_radios.py"
+    export_usb_wpa_env
+    if [[ -n "${FLUXCAST_USB_WPA:-}" ]]; then
+      echo "[miracast-ctl] USB wpa_supplicant=$FLUXCAST_USB_WPA" >>"$LOG_DIR/cast.log"
+    fi
+    python3 -u src/main.py \
+      --protocol wfd \
+      --wfd-peer "$peer" \
+      --monitor "$monitor" \
+      --wfd-capture-backend wf-recorder \
+      --wfd-aosp-pmt-pid \
+      --wfd-p2p-backend wpas \
+      --wfd-go-intent "$go_intent" \
+      "${p2p_channel_args[@]}" \
+      "${go_5ghz_args[@]}" \
+      "${wfd_iface_args[@]}" \
+      --fps "$fps" \
+      --output-res "$output_res" \
+      --bitrate "$bitrate" \
+      "${audio_args[@]}" \
+      --wfd-latency-log "$LAT_FILE" \
+      2>&1 | stamp_cast_log >>"$LOG_FILE"
+    # Pipeline exit would be the stamp filter's; keep FluxCast's status.
+    ec=${PIPESTATUS[0]}
+    # Don't overwrite a more specific failure already recorded by the health watcher.
+    current_phase="$(python3 -c 'import json,sys; 
+try: print(json.load(open(sys.argv[1])).get("phase",""))
+except Exception: print("")' "$STATUS_FILE" 2>/dev/null || true)"
+    if [[ "$current_phase" != "error" ]]; then
+      if rg -q "play_accepted|PLAY accepted" "$LAT_FILE" "$LOG_FILE" 2>/dev/null; then
+        printf '%s\n' "{\"phase\":\"idle\",\"message\":\"Session ended\",\"running\":false,\"peer\":\"$peer\",\"peerName\":\"$peer_name\",\"mode\":\"$mode\"}" > "$STATUS_FILE"
+      else
+        printf '%s\n' "{\"phase\":\"error\",\"message\":\"Cast failed before video started (exit $ec)\",\"running\":false,\"peer\":\"$peer\",\"peerName\":\"$peer_name\",\"mode\":\"$mode\"}" > "$STATUS_FILE"
+      fi
+    fi
+    rm -f "$PID_FILE"
+    # Full Extend teardown on any exit (manual stop, sink drop, capture death):
+    # remove the virtual output, restore cursor mode, and re-assert eDP so the
+    # laptop panel does not lock up after a scaled headless disappears.
+    if [[ "$mode" == "extend" ]]; then
+      cleanup_extend_monitor
+    fi
+    cast_animations_restore || true
+}
+
+
+cmd_health_watch() {
+  # Detached health/phase supervisor (setsid). Do not inherit `set -e`:
+  # a failed `rg`/`python3` was exiting the watcher and leaving the UI
+  # stuck on "waiting for air TX" with the Extend head parked at -12000.
+  set +e
+  set +u
+  # shellcheck disable=SC1090
+  source "$STATE_DIR/health-watch.env"
+  echo "[miracast-ctl] health-watch start pid=${pid:-?} $(date -Iseconds)" >>"$LOG_DIR/health-watch.log"
+  printf 'miracast-health\n' >/proc/self/comm 2>/dev/null || true
+    local saw_play=0
+    local saw_p2p=0
+    local air_proven=0
+    local missing_link=0
+    local play_tx_baseline=""
+    local air_lost_since=0
+    # Stay alive for the whole cast: promote phases, then detect sink drop
+    # only after PLAY (never during RTSP handshake).
+    # streaming ⇔ live air TX. If air TX dies, demote UI off streaming
+    # immediately so the connected icon cannot stick on a dark TV.
+    while kill -0 "$pid" 2>/dev/null; do
+      if [[ "$saw_play" -eq 0 ]] && rg -q "play_accepted|PLAY accepted" "$LAT_FILE" "$LOG_FILE" 2>/dev/null; then
+        write_status "rtsp" "PLAY accepted; waiting for air TX…" "peer=$peer" "peerName=$peer_name" "mode=$mode" "monitor=$monitor" "pid=$pid" "running=true" >/dev/null
+        saw_play=1
+        mark_play_sigusr1_grace || true
+        missing_link=0
+        play_tx_baseline="$(
+          python3 - "$LOG_DIR/cast.log" <<'PY' 2>/dev/null || true
+import re, sys
+from pathlib import Path
+lines = Path(sys.argv[1]).read_text(errors="ignore").splitlines() if Path(sys.argv[1]).is_file() else []
+for ln in reversed(lines):
+    m = re.search(r"tx\+(\d+)\s+KiB", ln)
+    if m:
+        print(m.group(1))
+        break
+PY
+        )"
+        # After PLAY: MCC → CSA to quiet channel; SCC → align onto STA channel
+        # (or quieter 2.4 if the sink cannot follow STA onto 5 GHz).
+        if [[ "$p2p_channel" =~ ^[0-9]+$ ]]; then
+          if [[ "$_want_quiet_csa" == "1" ]]; then
+            apply_p2p_quiet_csa "$p2p_channel" || true
+          else
+            apply_p2p_scc_align "$p2p_channel" || true
+          fi
+        else
+          echo "[miracast-ctl] CSA/align skipped (no target channel)" >>"$LOG_DIR/cast.log"
+        fi
+        # Link watcher can run during media warm-up.
+        start_miracast_link_watcher || true
+      elif [[ "$saw_play" -eq 1 && "$air_proven" -eq 0 ]]; then
+        # Promote to streaming only once air TX has clearly grown.
+        local air_ok
+        air_ok="$(
+          BASE="$play_tx_baseline" python3 - "$LOG_DIR/cast.log" <<'PY' 2>/dev/null || true
+import os, re, sys
+from pathlib import Path
+base = os.environ.get("BASE") or ""
+try:
+    base_i = int(base) if base.strip() else None
+except ValueError:
+    base_i = None
+lines = Path(sys.argv[1]).read_text(errors="ignore").splitlines() if Path(sys.argv[1]).is_file() else []
+tx = vf = None
+for ln in reversed(lines):
+    if "Sender health" not in ln:
+        continue
+    m = re.search(r"tx\+(\d+)\s+KiB", ln)
+    if not m:
+        continue
+    tx = int(m.group(1))
+    vm = re.search(r"video_frames=(\d+)", ln)
+    if vm:
+        vf = int(vm.group(1))
+    break
+if tx is None:
+    print("no")
+elif vf is not None and vf < 30 and tx < 200:
+    print("no")
+elif base_i is None:
+    print("yes" if tx >= 200 or (vf is not None and vf >= 60) else "no")
+elif (tx - base_i) >= 200:
+    print("yes")
+else:
+    print("no")
+PY
+        )"
+        if [[ "$air_ok" == "yes" ]]; then
+          write_status "streaming" "$action_word to $label" "peer=$peer" "peerName=$peer_name" "mode=$mode" "monitor=$monitor" "pid=$pid" "running=true" >/dev/null
+          air_proven=1
+          air_lost_since=0
+          echo "$(date -Iseconds) [miracast-ctl] air TX proven — UI → streaming" >>"$LOG_DIR/cast.log"
+          activate_miracast_audio_default || true
+        fi
+      elif [[ "$saw_play" -eq 0 ]]; then
+        # Live P2P only — never promote dhcp from historical cast.log lines
+        # ("P2P link is activated" stays in the append-only log after the
+        # group dies and used to keep the UI stuck on "P2P up").
+        if rg -q "rtsp_connected" "$LAT_FILE" 2>/dev/null && p2p_group_up; then
+          write_status "rtsp" "RTSP connected; negotiating media" "peer=$peer" "peerName=$peer_name" "mode=$mode" "pid=$pid" "running=true" >/dev/null
+        elif p2p_group_up; then
+          write_status "dhcp" "P2P up; waiting for sink IP / RTSP" "peer=$peer" "peerName=$peer_name" "mode=$mode" "pid=$pid" "running=true" >/dev/null
+        else
+          write_status "connecting" "Waiting for P2P group…" "peer=$peer" "peerName=$peer_name" "mode=$mode" "pid=$pid" "running=true" >/dev/null
+        fi
+      fi
+
+      # Keep streaming honest: demote UI the moment media/air looks dead.
+      # Also trip immediately on a fresh VIDEO_STALL / RTP-stagnant line —
+      # don't wait for the 8s health plateau while the icon stays "connected".
+      # During PLAY SIGUSR1 grace, capture rebind resets video_frames and
+      # looks like air-TX death — hold streaming so the watchdog does not
+      # stack another restart.
+      if [[ "$saw_play" -eq 1 && "$air_proven" -eq 1 ]] && in_play_sigusr1_grace; then
+        :
+      elif [[ "$saw_play" -eq 1 && "$air_proven" -eq 1 ]]; then
+        local stall_hit=0
+        if python3 - "$LOG_DIR/cast.log" <<'PY' 2>/dev/null
+import re, sys, time
+from pathlib import Path
+lines = Path(sys.argv[1]).read_text(errors="ignore").splitlines() if Path(sys.argv[1]).is_file() else []
+now = time.time()
+for ln in reversed(lines[-40:]):
+    if "VIDEO_STALL" in ln or "RTP TX stagnant" in ln:
+        m = re.search(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", ln)
+        if not m:
+            continue
+        try:
+            ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            continue
+        if now - ts <= 5:
+            raise SystemExit(0)  # hit
+        break
+raise SystemExit(1)
+PY
+        then
+          stall_hit=1
+        fi
+        local air_alive=yes
+        if [[ "$stall_hit" -eq 1 ]]; then
+          air_alive=no
+        else
+          air_alive="$(
+            python3 - "$LOG_DIR/cast.log" <<'PY' 2>/dev/null || true
+import re, sys, time
+from pathlib import Path
+lines = Path(sys.argv[1]).read_text(errors="ignore").splitlines() if Path(sys.argv[1]).is_file() else []
+samples = []
+for ln in lines:
+    if "Sender health" not in ln:
+        continue
+    m = re.search(
+        r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}).*tx\+(\d+)\s+KiB.*video_frames=(\d+)",
+        ln,
+    )
+    if not m:
+        continue
+    try:
+        ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
+        samples.append((ts, int(m.group(2)), int(m.group(3))))
+    except Exception:
+        continue
+samples = samples[-6:]
+if len(samples) < 2:
+    print("yes")
+    raise SystemExit(0)
+newest_ts, newest_tx, newest_vf = samples[-1]
+for ts, tx, vf in samples:
+    if (newest_ts - ts) >= 6 and (newest_tx - tx) >= 150 and newest_vf >= 30:
+        print("yes")
+        raise SystemExit(0)
+for ts, tx, vf in samples:
+    if (newest_ts - ts) >= 8 and (newest_tx - tx) <= 2:
+        print("no")
+        raise SystemExit(0)
+    if vf == newest_vf and (newest_ts - ts) >= 8 and newest_vf > 0:
+        print("no")
+        raise SystemExit(0)
+print("yes")
+PY
+          )"
+        fi
+        if [[ "$air_alive" == "no" ]]; then
+          air_proven=0
+          air_lost_since="$(date +%s)"
+          write_status "rtsp" "Air TX lost; recovering…" "peer=$peer" "peerName=$peer_name" "mode=$mode" "monitor=$monitor" "pid=$pid" "running=true" >/dev/null
+          echo "$(date -Iseconds) [miracast-ctl] air TX lost — UI demoted off streaming" >>"$LOG_DIR/cast.log"
+        fi
+      fi
+
+      # After demotion: re-prove air TX, or stop if it never returns.
+      if [[ "$saw_play" -eq 1 && "$air_proven" -eq 0 && "$air_lost_since" -gt 0 ]]; then
+        local now_s
+        now_s="$(date +%s)"
+        if (( now_s - air_lost_since >= 45 )); then
+          echo "$(date -Iseconds) [miracast-ctl] air TX unrecovered for 45s — stopping cast" >>"$LOG_DIR/cast.log"
+          write_status "idle" "Cast ended — air TX never recovered" "peer=$peer" "peerName=$peer_name" "mode=$mode" "running=false" >/dev/null
+          kill "$pid" 2>/dev/null || true
+          break
+        fi
+      fi
+
+      # Post-PLAY: P2P must stay up (5s miss → stop).
+      # Pre-PLAY: FluxCast owns handshake timeout. Persistent invite can
+      # bring a GO up then tear it down to fall back to GO Neg; killing
+      # here aborts before the TV can show an accept prompt.
+      if p2p_group_up; then
+        missing_link=0
+        saw_p2p=1
+        if [[ ! -f "$HEADLESS_FILE" ]]; then
+          local _hn=""
+          _hn="$(tracked_extend_name)"
+          [[ -n "$_hn" ]] && printf '%s\n' "$_hn" >"$HEADLESS_FILE"
+        fi
+        unpark_usb_extend_if_grouped || true
+      elif [[ "${saw_p2p:-0}" -eq 1 && "$saw_play" -eq 1 ]]; then
+        missing_link=$((missing_link + 1))
+        if [[ "$missing_link" -ge 5 ]]; then
+          write_status "error" "Sink disconnected after streaming started" "peer=$peer" "peerName=$peer_name" "mode=$mode" "running=false" >/dev/null
+          echo "$(date -Iseconds) [miracast-ctl] P2P group gone (missing_link=$missing_link saw_play=$saw_play) — stopping" >>"$LOG_DIR/cast.log"
+          kill "$pid" 2>/dev/null || true
+          python3 - <<'PY'
+import os, signal
+for p in os.listdir("/proc"):
+    if not p.isdigit():
+        continue
+    try:
+        exe = os.path.realpath(f"/proc/{p}/exe")
+    except OSError:
+        continue
+    if "python" not in os.path.basename(exe):
+        continue
+    try:
+        cmd = open(f"/proc/{p}/cmdline", "rb").read().replace(b"\0", b" ").decode()
+    except OSError:
+        continue
+    if "src/main.py" in cmd and "--protocol" in cmd and "wfd" in cmd:
+        try:
+            os.kill(int(p), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+PY
+          break
+        fi
+      fi
+      sleep 1
+    done
+}
+
+
 cmd_start() {
   local peer="" peer_name="" monitor="eDP-1" root="" go_intent="0" fps="" bitrate="" output_res="" with_audio="" auto_fw="1" mode=""
   local settings
@@ -5824,6 +6751,8 @@ if m:
     emit '{"ok":false,"error":"--peer MAC required"}'
     return 1
   fi
+  mkdir -p "$STATE_DIR"
+  date +%s >"$CONNECTING_LOCK_FILE"
   root="$(resolve_fluxcast_root "$root")"
   if [[ -z "$root" || ! -f "$root/src/main.py" ]]; then
     emit '{"ok":false,"error":"fluxcast root missing"}'
@@ -5839,6 +6768,7 @@ if m:
   if [[ -z "$peer_name" ]]; then
     peer_name="$(peer_name_for "$peer")"
   fi
+  persist_idle_if_cast_pid_dead || true
   write_settings "mode=$mode" "lastPeerMac=$peer" "lastPeerName=$peer_name" >/dev/null
   # Fresh cast: clear prior ABR settle locks + congestion cuts so WFD CBR
   # ceiling is computed fresh from the live link.
@@ -5908,6 +6838,7 @@ PY
   else
     cmd_stop >/dev/null
   fi
+  date +%s >"$CONNECTING_LOCK_FILE"
 
   if [[ "$mode" == "extend" ]]; then
     local headless
@@ -6035,278 +6966,26 @@ print(v if v in ("dmabuf","vaapi","cpu") else "dmabuf")' "$settings")"
     dmabuf) [[ "$video_encoder" == "libx264" || "$video_encoder" == "software" ]] && video_encoder="auto" ;;
   esac
 
-  (
-    cd "$root"
-    export PYTHONUNBUFFERED=1
-    export PATH="/usr/bin:/bin:$PATH"
-    export FLUXCAST_WFD_ENCODE_ENV_FILE="$ENCODE_ENV_FILE"
-    export FLUXCAST_MIRACAST_CTL="$PLUGIN_DIR/bin/miracast-ctl"
-    export FLUXCAST_WFD_ENCODER="$video_encoder"
-    export FLUXCAST_WFD_CAPTURE_ENCODE_FILE="$CAPTURE_ENCODE_FILE"
-    export FLUXCAST_WFD_CAPTURE_ENCODE_PREF="$capture_encode"
-    # Legacy CAPTURE_ENCODE still set for older FluxCast checkouts.
-    case "$capture_encode" in
-      dmabuf) export FLUXCAST_WFD_CAPTURE_ENCODE=vaapi ;;
-      vaapi) export FLUXCAST_WFD_CAPTURE_ENCODE=pipe ;;
-      cpu) export FLUXCAST_WFD_CAPTURE_ENCODE=pipe ;;
-    esac
-    # Smart View + DMA-BUF: keep retrying DMA across SIGUSR1 encode rebinds.
-    _strat="$(python3 -c 'import json,sys; print(str(json.loads(sys.argv[1]).get("encodeStrategy") or "smartview").lower())' "$settings" 2>/dev/null || echo smartview)"
-    if [[ "$_strat" == "smartview" && "$capture_encode" == "dmabuf" ]]; then
-      export FLUXCAST_WFD_DMABUF_STICKY=1
-      echo "[miracast-ctl] DMA-BUF sticky=on (QVBR strategy)" >>"$LOG_DIR/cast.log"
-    else
-      export FLUXCAST_WFD_DMABUF_STICKY=0
-    fi
-    # Scaled outputs use DMA-BUF by default (proven at integer scale 2 with
-    # tv-range CQP). Deny with FLUXCAST_WFD_DMABUF_ALLOW_SCALED=0 if needed.
-    export FLUXCAST_WFD_DMABUF_ALLOW_SCALED="${FLUXCAST_WFD_DMABUF_ALLOW_SCALED:-}"
-    # Prefer damage-aware capture (omit wf-recorder -D). Precedence:
-    # FLUXCAST_WFD_WF_RECORDER_DAMAGE env → settings.wfRecorderDamage → "1".
-    # Force continuous with DAMAGE=0 / wfRecorderDamage=0.
-    _dmg="$(python3 -c 'import json,sys; s=json.loads(sys.argv[1]); print(str(s.get("wfRecorderDamage","1")).strip() or "1")' "$settings" 2>/dev/null || echo 1)"
-    _dmg="${FLUXCAST_WFD_WF_RECORDER_DAMAGE:-$_dmg}"
-    if [[ "$_dmg" =~ ^(0|false|no|off)$ ]]; then
-      unset FLUXCAST_WFD_WF_RECORDER_DAMAGE
-      echo "[miracast-ctl] wf-recorder damage-aware=off (continuous -D)" >>"$LOG_DIR/cast.log"
-    else
-      export FLUXCAST_WFD_WF_RECORDER_DAMAGE=1
-      echo "[miracast-ctl] wf-recorder damage-aware=on (omit -D)" >>"$LOG_DIR/cast.log"
-    fi
-
-    # DMA CQP quantizer: settings.vaapiQp (default 18). `$settings` is JSON text
-    # from read_settings, not a path. Settings win over a stale env value.
-    _qp="$(python3 -c 'import json,sys
-s=json.loads(sys.argv[1])
-v=s.get("vaapiQp", None)
-if v is not None and str(v).strip()!="":
-  print(str(v).strip())
-else:
-  print((sys.argv[2] if len(sys.argv)>2 else "") or "18")
-' "$settings" "${FLUXCAST_WFD_VAAPI_QP:-}" 2>/dev/null || echo "${FLUXCAST_WFD_VAAPI_QP:-18}")"
-    export FLUXCAST_WFD_VAAPI_QP="$_qp"
-    echo "[miracast-ctl] VAAPI QP=$FLUXCAST_WFD_VAAPI_QP" >>"$LOG_DIR/cast.log"
-    # GOP frames: settings.vaapiGop → env → 60 (1s at 1080p60).
-    _gop="$(python3 -c 'import json,sys
-s=json.loads(sys.argv[1])
-v=s.get("vaapiGop", None)
-if v is not None and str(v).strip()!="":
-  print(str(v).strip())
-else:
-  print((sys.argv[2] if len(sys.argv)>2 else "") or "60")
-' "$settings" "${FLUXCAST_WFD_VAAPI_GOP:-}" 2>/dev/null || echo "${FLUXCAST_WFD_VAAPI_GOP:-60}")"
-    export FLUXCAST_WFD_VAAPI_GOP="$_gop"
-    echo "[miracast-ctl] VAAPI GOP=$FLUXCAST_WFD_VAAPI_GOP" >>"$LOG_DIR/cast.log"
-    # Rate control: settings.vaapiRcMode (CQP|QVBR|CBR|VBR) + bitrate for non-CQP.
-    _rc="$(python3 -c 'import json,sys
-s=json.loads(sys.argv[1])
-print(str(s.get("vaapiRcMode") or "CQP").strip().upper() or "CQP")
-' "$settings" 2>/dev/null || echo CQP)"
-    export FLUXCAST_WFD_VAAPI_RC="$_rc"
-    _br="$(python3 -c 'import json,sys
-s=json.loads(sys.argv[1])
-print(str(s.get("vaapiBitrate") or "12M").strip() or "12M")
-' "$settings" 2>/dev/null || echo 12M)"
-    export FLUXCAST_WFD_VAAPI_BITRATE="$_br"
-    # Settings default; pre-set FLUXCAST_WFD_VAAPI_QUALITY wins (A/B tests).
-    # Default 5: pipe A/B — q2 choppier; q7+tight VBV stalled.
-    _qual="$(python3 -c 'import json,sys
-s=json.loads(sys.argv[1])
-print(str(s.get("vaapiQuality") or "5").strip() or "5")
-' "$settings" 2>/dev/null || echo 5)"
-    _qual="${FLUXCAST_WFD_VAAPI_QUALITY:-$_qual}"
-    export FLUXCAST_WFD_VAAPI_QUALITY="$_qual"
-    _async="$(python3 -c 'import json,sys
-s=json.loads(sys.argv[1])
-print(str(s.get("vaapiAsyncDepth") or "2").strip() or "2")
-' "$settings" 2>/dev/null || echo 2)"
-    _async="${FLUXCAST_WFD_VAAPI_ASYNC_DEPTH:-$_async}"
-    # Pipe VAAPI: quality<4 or async>1 hung on-device (bufs_size → audio-only).
-    _ce="$(python3 -c 'import json,sys
-s=json.loads(sys.argv[1])
-print(str(s.get("captureEncode") or "").strip().lower())
-' "$settings" 2>/dev/null || echo "")"
-    if [[ "$_ce" == "vaapi" || "$_ce" == "cpu" || "${FLUXCAST_WFD_CAPTURE_ENCODE_PREF:-}" == "vaapi" ]]; then
-      if [[ -z "${FLUXCAST_WFD_VAAPI_PIPE_UNSAFE:-}" ]]; then
-        # quality=1 hung the pipe; allow 3+ for sharper CBR on hard scenes.
-        if [[ "${_qual:-4}" =~ ^[0-9]+$ ]] && (( _qual < 3 )); then
-          echo "[miracast-ctl] clamp pipe VAAPI quality $_qual→3" >>"$LOG_DIR/cast.log"
-          _qual=3
-          export FLUXCAST_WFD_VAAPI_QUALITY="$_qual"
-        fi
-        if [[ "${_async:-1}" =~ ^[0-9]+$ ]] && (( _async > 1 )); then
-          echo "[miracast-ctl] clamp pipe VAAPI async $_async→1" >>"$LOG_DIR/cast.log"
-          _async=1
-        fi
-      fi
-    fi
-    export FLUXCAST_WFD_VAAPI_ASYNC_DEPTH="$_async"
-    _iqf="$(python3 -c 'import json,sys
-s=json.loads(sys.argv[1])
-print(str(s.get("vaapiIQfactor") or "").strip())
-' "$settings" 2>/dev/null || echo "")"
-    if [[ -n "$_iqf" ]]; then
-      export FLUXCAST_WFD_VAAPI_I_QFACTOR="$_iqf"
-    else
-      unset FLUXCAST_WFD_VAAPI_I_QFACTOR 2>/dev/null || true
-    fi
-    echo "[miracast-ctl] VAAPI RC=$FLUXCAST_WFD_VAAPI_RC bitrate=$FLUXCAST_WFD_VAAPI_BITRATE quality=$FLUXCAST_WFD_VAAPI_QUALITY async=$_async i_qfactor=${FLUXCAST_WFD_VAAPI_I_QFACTOR:-none} profile=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1]).get("encodeProfile","medium"))' "$settings" 2>/dev/null || echo medium) content=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1]).get("castPreset","desktop"))' "$settings" 2>/dev/null || echo desktop)" >>"$LOG_DIR/cast.log"
-    # QVBR: honor settings vbvMultiplier (default 2.0). CQP stays latency-first.
-    _vbv="$(PYTHONPATH="$PLUGIN_DIR/scripts${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
-import json, sys
-from encode_strategy import QVBR_VBV_MULTIPLIER, latency_first_vbv_multiplier, bitrate_to_mbps, normalize_strategy
-s = json.loads(sys.argv[1])
-strat = normalize_strategy(s.get("encodeStrategy"))
-rc = str(s.get("vaapiRcMode") or "").strip().upper()
-if strat == "smartview" or rc == "QVBR":
-    raw = str(s.get("vbvMultiplier") or "").strip()
-    try:
-        v = float(raw)
-    except ValueError:
-        v = QVBR_VBV_MULTIPLIER
-    if v < 1.0:
-        v = QVBR_VBV_MULTIPLIER
-    print("%g" % max(1.0, min(4.0, v)))
-else:
-    enc = bitrate_to_mbps(s.get("vaapiBitrate") or s.get("bitrate") or "2.4M")
-    print("%g" % latency_first_vbv_multiplier(enc, None))
-' "$settings" 2>/dev/null || echo 2.0)"
-    _vbv="${FLUXCAST_WFD_VBV_MULTIPLIER:-$_vbv}"
-    export FLUXCAST_WFD_VBV_MULTIPLIER="$_vbv"
-    unset FLUXCAST_WFD_VAAPI_PIPE_LOW_LATENCY 2>/dev/null || true
-    echo "[miracast-ctl] VBV_MULTIPLIER=$FLUXCAST_WFD_VBV_MULTIPLIER air=${FLUXCAST_WFD_AIR_MBPS:-unknown} (QVBR HRD)" >>"$LOG_DIR/cast.log"
-    # Optional ICC / custom wf-recorder: env or settings.wfRecorderBin only
-    # (see resolve_wf_recorder_env). Default = PATH stock binary.
-    local _wf_env _wf_bin _wf_proto
-    _wf_env="$(resolve_wf_recorder_env 2>>"$LOG_DIR/cast.log")"
-    eval "$_wf_env"
-    _wf_bin="${WF_RECORDER_BIN:-}"
-    _wf_proto="${WF_RECORDER_PROTO:-auto}"
-    if [[ -n "$_wf_bin" ]]; then
-      export FLUXCAST_WFD_WF_RECORDER_BIN="$_wf_bin"
-      export FLUXCAST_WFD_WF_RECORDER_PROTO="$_wf_proto"
-      # ICC: skip painting the HW cursor plane into capture (reduces ghosts when
-      # the pointer leaves the Miracast head). SW cursors still appear if enabled.
-      export WF_RECORDER_NO_PAINT_CURSORS="${WF_RECORDER_NO_PAINT_CURSORS:-1}"
-      echo "[miracast-ctl] wf-recorder BIN=$_wf_bin PROTO=$_wf_proto NO_PAINT_CURSORS=$WF_RECORDER_NO_PAINT_CURSORS" >>"$LOG_DIR/cast.log"
-      # Do not load ICC during USB GO Neg (KMS). Health watcher loads it at unpark.
-    else
-      unset FLUXCAST_WFD_WF_RECORDER_BIN FLUXCAST_WFD_WF_RECORDER_PROTO 2>/dev/null || true
-      echo "[miracast-ctl] wf-recorder using PATH (stock default)" >>"$LOG_DIR/cast.log"
-      unload_icc_present_kick
-    fi
-    export FLUXCAST_WFD_MODE_STATE="$MODE_STATE_FILE"
-    # Default: RTSP picks the sink's best progressive CEA/VESA mode (pixel-rate).
-    # Set FLUXCAST_WFD_MODE_POLICY=match_settings to honor streamMode/fps instead.
-    export FLUXCAST_WFD_MODE_POLICY="${FLUXCAST_WFD_MODE_POLICY:-best_advertised}"
-    # When set (file exists), FluxCast must not auto-rebind over an intentional
-    # pause (screen lock / Extend position move).
-    export FLUXCAST_CAPTURE_PAUSE_FILE="$CAPTURE_PAUSED_FILE"
-    clear_capture_paused
-    local wifi_iface="" wfd_iface_args=() go_5ghz_args=()
-    wifi_iface="$(resolve_p2p_wifi_iface)"
-    if [[ -n "$wifi_iface" ]]; then
-      wfd_iface_args=(--wfd-interface "$wifi_iface")
-      export FLUXCAST_WFD_INTERFACE="$wifi_iface"
-      echo "[miracast-ctl] P2P Wi-Fi iface=$wifi_iface" >>"$LOG_DIR/cast.log"
-      if is_usb_wifi_iface "$wifi_iface"; then
-        if [[ "$go_intent" == "0" || "$go_intent" -lt 8 ]]; then
-          go_intent=15
-          echo "[miracast-ctl] USB P2P: go_intent=15 first (GO; client Confirm TX drops on SoftMAC)" >>"$LOG_DIR/cast.log"
-        fi
-        # Pass peer listen MHz from last scan so USB PD/Neg hits that channel.
-        local _listen_mhz=""
-        _listen_mhz="$(python3 -c 'import json,sys
-mac=sys.argv[1].replace("-",":").upper()
-try:
-  rows=json.load(open(sys.argv[2]))
-except Exception:
-  rows=[]
-for p in rows:
-  if str(p.get("mac") or "").replace("-",":").upper()!=mac:
-    continue
-  for k in ("listenFreqMHz","operFreqMHz"):
-    v=p.get(k)
-    if v in (None,"",0,"0"):
-      continue
-    try:
-      n=int(v)
-    except Exception:
-      continue
-    if n>0:
-      print(n); raise SystemExit
-' "$peer" "$PEERS_FILE" 2>/dev/null || true)"
-        if [[ -n "$_listen_mhz" ]]; then
-          export FLUXCAST_PEER_LISTEN_MHZ="$_listen_mhz"
-          echo "[miracast-ctl] USB P2P: peer listen ${_listen_mhz} MHz from scan cache" >>"$LOG_DIR/cast.log"
-        else
-          unset FLUXCAST_PEER_LISTEN_MHZ 2>/dev/null || true
-        fi
-        local _go_5ghz=0
-        _go_5ghz="$(python3 -c 'import json,sys
-s=json.loads(sys.argv[1])
-v=s.get("p2pGo5GHz", False)
-print("1" if v in (True,1,"1","true","yes","on") else "0")
-' "$settings" 2>/dev/null || echo 0)"
-        if [[ "${FLUXCAST_WFD_GO_5GHZ:-}" =~ ^(1|true|yes|on)$ ]]; then
-          _go_5ghz=1
-        fi
-        if [[ "$_go_5ghz" == "1" ]]; then
-          go_5ghz_args=(--wfd-go-5ghz)
-          echo "[miracast-ctl] USB P2P: keep 5 GHz in GO channel set (--wfd-go-5ghz)" >>"$LOG_DIR/cast.log"
-        else
-          echo "[miracast-ctl] USB P2P: GO 2.4 GHz only (p2p_no_go_freq; p2pGo5GHz=true to keep 5 GHz)" >>"$LOG_DIR/cast.log"
-        fi
-      fi
-    fi
-    export FLUXCAST_LIST_P2P_RADIOS="$PLUGIN_DIR/scripts/list_p2p_radios.py"
-    export_usb_wpa_env
-    if [[ -n "${FLUXCAST_USB_WPA:-}" ]]; then
-      echo "[miracast-ctl] USB wpa_supplicant=$FLUXCAST_USB_WPA" >>"$LOG_DIR/cast.log"
-    fi
-    python3 -u src/main.py \
-      --protocol wfd \
-      --wfd-peer "$peer" \
-      --monitor "$monitor" \
-      --wfd-capture-backend wf-recorder \
-      --wfd-aosp-pmt-pid \
-      --wfd-p2p-backend wpas \
-      --wfd-go-intent "$go_intent" \
-      "${p2p_channel_args[@]}" \
-      "${go_5ghz_args[@]}" \
-      "${wfd_iface_args[@]}" \
-      --fps "$fps" \
-      --output-res "$output_res" \
-      --bitrate "$bitrate" \
-      "${audio_args[@]}" \
-      --wfd-latency-log "$LAT_FILE" \
-      2>&1 | stamp_cast_log >>"$LOG_FILE"
-    # Pipeline exit would be the stamp filter's; keep FluxCast's status.
-    ec=${PIPESTATUS[0]}
-    # Don't overwrite a more specific failure already recorded by the health watcher.
-    current_phase="$(python3 -c 'import json,sys; 
-try: print(json.load(open(sys.argv[1])).get("phase",""))
-except Exception: print("")' "$STATUS_FILE" 2>/dev/null || true)"
-    if [[ "$current_phase" != "error" ]]; then
-      if rg -q "play_accepted|PLAY accepted" "$LAT_FILE" "$LOG_FILE" 2>/dev/null; then
-        printf '%s\n' "{\"phase\":\"idle\",\"message\":\"Session ended\",\"running\":false,\"peer\":\"$peer\",\"peerName\":\"$peer_name\",\"mode\":\"$mode\"}" > "$STATUS_FILE"
-      else
-        printf '%s\n' "{\"phase\":\"error\",\"message\":\"Cast failed before video started (exit $ec)\",\"running\":false,\"peer\":\"$peer\",\"peerName\":\"$peer_name\",\"mode\":\"$mode\"}" > "$STATUS_FILE"
-      fi
-    fi
-    rm -f "$PID_FILE"
-    # Full Extend teardown on any exit (manual stop, sink drop, capture death):
-    # remove the virtual output, restore cursor mode, and re-assert eDP so the
-    # laptop panel does not lock up after a scaled headless disappears.
-    if [[ "$mode" == "extend" ]]; then
-      cleanup_extend_monitor
-    fi
-    cast_animations_restore || true
-  ) &
-  local pid=$!
+  mkdir -p "$STATE_DIR"
+  {
+    declare -p root peer peer_name monitor go_intent fps bitrate output_res mode settings capture_encode video_encoder
+    declare -p LAT_FILE LOG_FILE PID_FILE STATUS_FILE PLUGIN_DIR LOG_DIR ENCODE_ENV_FILE CAPTURE_ENCODE_FILE
+    declare -p p2p_channel 2>/dev/null || true
+    declare -a p2p_channel_args=("${p2p_channel_args[@]+"${p2p_channel_args[@]}"}")
+    declare -p p2p_channel_args
+    declare -a go_5ghz_args=("${go_5ghz_args[@]+"${go_5ghz_args[@]}"}")
+    declare -p go_5ghz_args
+    declare -a wfd_iface_args=("${wfd_iface_args[@]+"${wfd_iface_args[@]}"}")
+    declare -p wfd_iface_args
+    declare -a audio_args=("${audio_args[@]+"${audio_args[@]}"}")
+    declare -p audio_args
+  } >"$STATE_DIR/cast-pipeline.env"
+  local pid
+  pid="$(fork_setsid "$PLUGIN_DIR/bin/miracast-ctl" _cast-pipeline)"
   echo "$pid" > "$PID_FILE"
-  # Distinguish from hung `start` leftovers in ps (comm only; argv still bash).
   printf 'miracast-cast\n' >"/proc/$pid/comm" 2>/dev/null || true
+  echo "[miracast-ctl] FluxCast session pid=$pid (setsid)" >>"$LOG_DIR/cast.log"
+
   # hl.config(animations/direct_scanout) recommits eDP. Do not do it in the
   # same window as output create/geometry (22:16 hang was ~2s after ctl returned).
   (
@@ -6315,239 +6994,14 @@ except Exception: print("")' "$STATUS_FILE" 2>/dev/null || true)"
     cast_animations_disable || true
   ) &
 
-  (
-    printf 'miracast-health\n' >/proc/self/comm 2>/dev/null || true
-    local saw_play=0
-    local saw_p2p=0
-    local air_proven=0
-    local missing_link=0
-    local play_tx_baseline=""
-    local air_lost_since=0
-    # Stay alive for the whole cast: promote phases, then detect sink drop
-    # only after PLAY (never during RTSP handshake).
-    # streaming ⇔ live air TX. If air TX dies, demote UI off streaming
-    # immediately so the connected icon cannot stick on a dark TV.
-    while kill -0 "$pid" 2>/dev/null; do
-      if [[ "$saw_play" -eq 0 ]] && rg -q "play_accepted|PLAY accepted" "$LAT_FILE" "$LOG_FILE" 2>/dev/null; then
-        write_status "rtsp" "PLAY accepted; waiting for air TX…" "peer=$peer" "peerName=$peer_name" "mode=$mode" "monitor=$monitor" "pid=$pid" "running=true" >/dev/null
-        saw_play=1
-        missing_link=0
-        play_tx_baseline="$(
-          python3 - "$LOG_DIR/cast.log" <<'PY' 2>/dev/null || true
-import re, sys
-from pathlib import Path
-lines = Path(sys.argv[1]).read_text(errors="ignore").splitlines() if Path(sys.argv[1]).is_file() else []
-for ln in reversed(lines):
-    m = re.search(r"tx\+(\d+)\s+KiB", ln)
-    if m:
-        print(m.group(1))
-        break
-PY
-        )"
-        # After PLAY: MCC → CSA to quiet channel; SCC → align onto STA channel
-        # (or quieter 2.4 if the sink cannot follow STA onto 5 GHz).
-        if [[ "$p2p_channel" =~ ^[0-9]+$ ]]; then
-          if [[ "$_want_quiet_csa" == "1" ]]; then
-            apply_p2p_quiet_csa "$p2p_channel" || true
-          else
-            apply_p2p_scc_align "$p2p_channel" || true
-          fi
-        else
-          echo "[miracast-ctl] CSA/align skipped (no target channel)" >>"$LOG_DIR/cast.log"
-        fi
-        # Link watcher can run during media warm-up.
-        start_miracast_link_watcher || true
-      elif [[ "$saw_play" -eq 1 && "$air_proven" -eq 0 ]]; then
-        # Promote to streaming only once air TX has clearly grown.
-        local air_ok
-        air_ok="$(
-          BASE="$play_tx_baseline" python3 - "$LOG_DIR/cast.log" <<'PY' 2>/dev/null || true
-import os, re, sys
-from pathlib import Path
-base = os.environ.get("BASE") or ""
-try:
-    base_i = int(base) if base.strip() else None
-except ValueError:
-    base_i = None
-lines = Path(sys.argv[1]).read_text(errors="ignore").splitlines() if Path(sys.argv[1]).is_file() else []
-tx = vf = None
-for ln in reversed(lines):
-    if "Sender health" not in ln:
-        continue
-    m = re.search(r"tx\+(\d+)\s+KiB", ln)
-    if not m:
-        continue
-    tx = int(m.group(1))
-    vm = re.search(r"video_frames=(\d+)", ln)
-    if vm:
-        vf = int(vm.group(1))
-    break
-if tx is None:
-    print("no")
-elif vf is not None and vf < 30 and tx < 200:
-    print("no")
-elif base_i is None:
-    print("yes" if tx >= 200 or (vf is not None and vf >= 60) else "no")
-elif (tx - base_i) >= 200:
-    print("yes")
-else:
-    print("no")
-PY
-        )"
-        if [[ "$air_ok" == "yes" ]]; then
-          write_status "streaming" "$action_word to $label" "peer=$peer" "peerName=$peer_name" "mode=$mode" "monitor=$monitor" "pid=$pid" "running=true" >/dev/null
-          air_proven=1
-          air_lost_since=0
-          echo "$(date -Iseconds) [miracast-ctl] air TX proven — UI → streaming" >>"$LOG_DIR/cast.log"
-          activate_miracast_audio_default || true
-        fi
-      elif [[ "$saw_play" -eq 0 ]]; then
-        # Live P2P only — never promote dhcp from historical cast.log lines
-        # ("P2P link is activated" stays in the append-only log after the
-        # group dies and used to keep the UI stuck on "P2P up").
-        if rg -q "rtsp_connected" "$LAT_FILE" 2>/dev/null && p2p_group_up; then
-          write_status "rtsp" "RTSP connected; negotiating media" "peer=$peer" "peerName=$peer_name" "mode=$mode" "pid=$pid" "running=true" >/dev/null
-        elif p2p_group_up; then
-          write_status "dhcp" "P2P up; waiting for sink IP / RTSP" "peer=$peer" "peerName=$peer_name" "mode=$mode" "pid=$pid" "running=true" >/dev/null
-        else
-          write_status "connecting" "Waiting for P2P group…" "peer=$peer" "peerName=$peer_name" "mode=$mode" "pid=$pid" "running=true" >/dev/null
-        fi
-      fi
-
-      # Keep streaming honest: demote UI the moment media/air looks dead.
-      # Also trip immediately on a fresh VIDEO_STALL / RTP-stagnant line —
-      # don't wait for the 8s health plateau while the icon stays "connected".
-      if [[ "$saw_play" -eq 1 && "$air_proven" -eq 1 ]]; then
-        local stall_hit=0
-        if python3 - "$LOG_DIR/cast.log" <<'PY' 2>/dev/null
-import re, sys, time
-from pathlib import Path
-lines = Path(sys.argv[1]).read_text(errors="ignore").splitlines() if Path(sys.argv[1]).is_file() else []
-now = time.time()
-for ln in reversed(lines[-40:]):
-    if "VIDEO_STALL" in ln or "RTP TX stagnant" in ln:
-        m = re.search(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", ln)
-        if not m:
-            continue
-        try:
-            ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
-        except Exception:
-            continue
-        if now - ts <= 5:
-            raise SystemExit(0)  # hit
-        break
-raise SystemExit(1)
-PY
-        then
-          stall_hit=1
-        fi
-        local air_alive=yes
-        if [[ "$stall_hit" -eq 1 ]]; then
-          air_alive=no
-        else
-          air_alive="$(
-            python3 - "$LOG_DIR/cast.log" <<'PY' 2>/dev/null || true
-import re, sys, time
-from pathlib import Path
-lines = Path(sys.argv[1]).read_text(errors="ignore").splitlines() if Path(sys.argv[1]).is_file() else []
-samples = []
-for ln in lines:
-    if "Sender health" not in ln:
-        continue
-    m = re.search(
-        r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}).*tx\+(\d+)\s+KiB.*video_frames=(\d+)",
-        ln,
-    )
-    if not m:
-        continue
-    try:
-        ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
-        samples.append((ts, int(m.group(2)), int(m.group(3))))
-    except Exception:
-        continue
-samples = samples[-6:]
-if len(samples) < 2:
-    print("yes")
-    raise SystemExit(0)
-newest_ts, newest_tx, newest_vf = samples[-1]
-for ts, tx, vf in samples:
-    if (newest_ts - ts) >= 6 and (newest_tx - tx) >= 150 and newest_vf >= 30:
-        print("yes")
-        raise SystemExit(0)
-for ts, tx, vf in samples:
-    if (newest_ts - ts) >= 8 and (newest_tx - tx) <= 2:
-        print("no")
-        raise SystemExit(0)
-    if vf == newest_vf and (newest_ts - ts) >= 8 and newest_vf > 0:
-        print("no")
-        raise SystemExit(0)
-print("yes")
-PY
-          )"
-        fi
-        if [[ "$air_alive" == "no" ]]; then
-          air_proven=0
-          air_lost_since="$(date +%s)"
-          write_status "rtsp" "Air TX lost; recovering…" "peer=$peer" "peerName=$peer_name" "mode=$mode" "monitor=$monitor" "pid=$pid" "running=true" >/dev/null
-          echo "$(date -Iseconds) [miracast-ctl] air TX lost — UI demoted off streaming" >>"$LOG_DIR/cast.log"
-        fi
-      fi
-
-      # After demotion: re-prove air TX, or stop if it never returns.
-      if [[ "$saw_play" -eq 1 && "$air_proven" -eq 0 && "$air_lost_since" -gt 0 ]]; then
-        local now_s
-        now_s="$(date +%s)"
-        if (( now_s - air_lost_since >= 45 )); then
-          echo "$(date -Iseconds) [miracast-ctl] air TX unrecovered for 45s — stopping cast" >>"$LOG_DIR/cast.log"
-          write_status "idle" "Cast ended — air TX never recovered" "peer=$peer" "peerName=$peer_name" "mode=$mode" "running=false" >/dev/null
-          kill "$pid" 2>/dev/null || true
-          break
-        fi
-      fi
-
-      # Post-PLAY: P2P must stay up (5s miss → stop).
-      # Pre-PLAY: FluxCast owns handshake timeout. Persistent invite can
-      # bring a GO up then tear it down to fall back to GO Neg; killing
-      # here aborts before the TV can show an accept prompt.
-      if p2p_group_up; then
-        missing_link=0
-        saw_p2p=1
-        unpark_usb_extend_if_grouped || true
-      elif [[ "${saw_p2p:-0}" -eq 1 && "$saw_play" -eq 1 ]]; then
-        missing_link=$((missing_link + 1))
-        if [[ "$missing_link" -ge 5 ]]; then
-          write_status "error" "Sink disconnected after streaming started" "peer=$peer" "peerName=$peer_name" "mode=$mode" "running=false" >/dev/null
-          echo "$(date -Iseconds) [miracast-ctl] P2P group gone (missing_link=$missing_link saw_play=$saw_play) — stopping" >>"$LOG_DIR/cast.log"
-          kill "$pid" 2>/dev/null || true
-          python3 - <<'PY'
-import os, signal
-for p in os.listdir("/proc"):
-    if not p.isdigit():
-        continue
-    try:
-        exe = os.path.realpath(f"/proc/{p}/exe")
-    except OSError:
-        continue
-    if "python" not in os.path.basename(exe):
-        continue
-    try:
-        cmd = open(f"/proc/{p}/cmdline", "rb").read().replace(b"\0", b" ").decode()
-    except OSError:
-        continue
-    if "src/main.py" in cmd and "--protocol" in cmd and "wfd" in cmd:
-        try:
-            os.kill(int(p), signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-PY
-          break
-        fi
-      fi
-      sleep 1
-    done
-  ) &
-  echo $! >"$HEALTH_WATCH_PID_FILE"
-  echo "[miracast-ctl] health watcher pid=$!" >>"$LOG_DIR/cast.log"
+  {
+    declare -p pid peer peer_name mode monitor p2p_channel LAT_FILE LOG_FILE STATUS_FILE PID_FILE PLUGIN_DIR LOG_DIR
+    declare -p _want_quiet_csa 2>/dev/null || true
+  } >"$STATE_DIR/health-watch.env"
+  local hpid
+  hpid="$(MIRACAST_SETSID_LOG="$LOG_DIR/health-watch.log" fork_setsid "$PLUGIN_DIR/bin/miracast-ctl" _health-watch)"
+  echo "$hpid" >"$HEALTH_WATCH_PID_FILE"
+  echo "[miracast-ctl] health watcher pid=$hpid (setsid)" >>"$LOG_DIR/cast.log"
 
   emit "{\"ok\":true,\"pid\":$pid,\"peer\":\"$peer\",\"peerName\":\"$peer_name\",\"mode\":\"$mode\",\"monitor\":\"$monitor\",\"phase\":\"connecting\"}"
 }
@@ -6587,6 +7041,7 @@ Commands:
   benchmark performance           # 60s live sample; requires active cast
   get-extend-position
   set-extend-position right|left|above|below
+  place-virtual-head              # layout service: park idle / place live Extend
   restart-capture [quick]
   ensure-capture [attempts]   # verify/rebuild capture after scale settle
   pause-capture
@@ -6644,7 +7099,7 @@ data["bitrate"] = br
 data["vaapiBitrate"] = br
 data["encodeWfdBitrateMbps"] = round(kbps / 1000.0, 3)
 data["encodeCongestionBitrateMbps"] = round(kbps / 1000.0, 3)
-data["vaapiGop"] = int(data.get("vaapiGop") or 30) or 30
+data["vaapiGop"] = int(data.get("vaapiGop") or 60) or 60
 data["vaapiAsyncDepth"] = 1
 if qp:
     data["vaapiQp"] = int(qp)
@@ -6714,7 +7169,7 @@ data["bitrate"] = fmt(nxt)
 data["vaapiBitrate"] = fmt(nxt)
 data["encodeWfdBitrateMbps"] = round(nxt, 3)
 data["encodeCongestionBitrateMbps"] = round(nxt, 3)
-data["vaapiGop"] = int(data.get("vaapiGop") or 30) or 30
+data["vaapiGop"] = int(data.get("vaapiGop") or 60) or 60
 data["vaapiAsyncDepth"] = 1
 if int(str(data.get("vaapiQuality") or "5")) < 3:
     data["vaapiQuality"] = "3"
@@ -6904,6 +7359,13 @@ main() {
     scan) cmd_scan "$@" ;;
     pick-channel|pick_channel) cmd_pick_channel "$@" ;;
     start) cmd_start "$@" ;;
+    _cast-pipeline) cmd_cast_pipeline "$@" ;;
+    _health-watch) cmd_health_watch "$@" ;;
+    _restart-link-watch)
+      stop_miracast_link_watcher >/dev/null 2>&1 || true
+      start_miracast_link_watcher || true
+      emit "{\"ok\":true,\"pid\":\"$(tr -d '[:space:]' <"$LINK_WATCH_PID_FILE" 2>/dev/null || true)\"}"
+      ;;
     status) cmd_status "$@" ;;
     stop) cmd_stop "$@" ;;
     get-mode|get_mode) cmd_get_mode "$@" ;;
@@ -6926,6 +7388,7 @@ main() {
     benchmark|auto-tune|auto_tune) cmd_benchmark "$@" ;;
     get-extend-position|get_extend_position) cmd_get_extend_position "$@" ;;
     set-extend-position|set_extend_position) cmd_set_extend_position "$@" ;;
+    place-virtual-head|place_virtual_head) cmd_place_virtual_head "$@" ;;
     restart-capture|restart_capture) cmd_restart_capture "$@" ;;
     ensure-capture|ensure_capture) cmd_ensure_capture "$@" ;;
     capture-health|capture_health) cmd_capture_health "$@" ;;

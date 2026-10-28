@@ -13,24 +13,29 @@ variables set by `miracast-ctl`; damage-aware capture remains opt-in.
 | `src/wfd/modes.py` | Full classic CEA table; CHP for M4; interlaced listed but not negotiated; default RTSP pick is best advertised progressive mode (`FLUXCAST_WFD_MODE_POLICY`) |
 | `src/wfd/constants.py` | CEA bit constants (0–16) + VESA 1200p |
 | `src/wfd/config.py` | `peer_address` for mode-state JSON; `WFDCEAMode.interlaced` |
-| `src/wfd/session.py` | SIGUSR1 ignore until capture ready; open WFD 7236 before USB connect; peer MAC on media config |
+| `src/wfd/session.py` | SIGUSR1 ignore until capture ready; open WFD 7236 before USB connect; peer MAC on media config; dedicated-GO RTSP-join watch (invite / abandon) |
 | `src/wfd/privileged.py` | Unified `sudo` / `sudo -A` + graphical askpass; global timestamp ticket |
 | `src/wfd/ie.py` | Length-prefixed WFD Device Info + Local IP for `wfd_subelem_set` |
-| `src/wfd/encoding.py` | Generic IDR GOP (cap 30) and VBV; no per-brand name keys |
+| `src/wfd/encoding.py` | Generic IDR GOP (cap 30) and VBV; IDR coalesce (one per GOP); LPCM only if air + 5 GHz phy can carry it; no per-brand name keys |
 | `src/wfd/proc.py` | Privileged process helpers used by dedicated USB wpa |
 | `src/wfd/p2p/device.py` | P2P OperChannel for 2.4GHz + non-DFS 5GHz (quiet-channel picks) |
 | `src/wfd/p2p/formation.py` | `freq_to_p2p_class_channel`; peer advertised freqs; 5 GHz listen maps to class 124 |
 | `src/wfd/p2p/peers.py` | USB dedicated scan / name parse |
-| `src/wfd/p2p/usb_dedicated.py` | Dedicated USB SoftMAC GO; PLAY-gated persistent invite; 1-stream CSA to 2.4 GHz |
-| `src/wfd/p2p/wpas.py` | Hard Connect `frequency=`; wait for `AP-STA-CONNECTED` before IP flush; remanage on failure |
-| `src/wfd/p2p/wpas_ip.py` | Privileged DHCP/firewall; serve P2P device + STA MACs; skip recycle on live GO |
+| `src/wfd/p2p/safety.py` | Validate iface/MAC/IPv4 before sudo argv and state-file names |
+| `src/wfd/p2p/stability.py` | On-demand Wi-Fi chip workarounds from sysfs (USB runtime PM, mt76 USB disable_usb_sg); not iface names |
+| `src/wfd/p2p/usb_dedicated.py` | Dedicated wpa on a secondary radio only (never the default-route STA); snapshot/restore NM connection on fail/stop; GO ACL allows P2P device+iface MACs during WPS; formation → PLAY on formation channel → optional mid-session 802.11 CSA (revert + per-MAC nofollow if STA does not follow); RTSP-wait invite if STA leaves before M1; applies radio stability on connect |
+| `src/wfd/p2p/wpas.py` | NM STA / wpas P2P split (`meta/99-fluxcast-p2p.conf`); never remanage p2p-*; skip STA-channel force when peer listen/oper differs; non-persistent Connect; wait for client carrier |
+| `meta/99-fluxcast-p2p.conf` | NM `unmanaged-devices` for `p2p-dev-*` and `p2p-*`; STA uplink stays managed |
+| `meta/85-fluxcast-p2p-unmanaged.rules` | udev `NM_UNMANAGED=1` on `p2p-*` at add so NM cannot race-kill the group iface |
+| `meta/zz-fluxcast-deny-remove-iface.conf` | Deny root `RemoveInterface` on wpa (NM was deleting p2p-wlp* 0.3ms after GroupStarted) |
+| `src/wfd/p2p/wpas_ip.py` | Privileged DHCP/firewall; serve P2P device + STA MACs; GARP after lease so sink can SYN RTSP; skip recycle on live GO |
 | `src/wfd/p2p/dbus.py` | Privileged calls via `privileged.py` (no pkexec) |
 | `src/wfd/media/portal.py` | Tight VBV for all sinks (no LG 4 Mbps cap) |
-| `src/wfd/media/wlroots.py` | DMA-BUF `h264_vaapi`+CQP; ICC `-r`; ffmpeg IO watchdog; LPCM via `pw-cat --target` |
+| `src/wfd/media/wlroots.py` | DMA-BUF `h264_vaapi`+CQP; ICC `-r`; ffmpeg IO watchdog; LPCM via `pw-cat --target`; AAC encoded in ffmpeg (ADTS), not copied from NUT |
 | `src/wfd/wf_recorder.py` | Optional `FLUXCAST_WFD_WF_RECORDER_BIN` / `…_PROTO=icc` for PR #347 builds |
 | `src/wfd/media/pipeline.py` | Desktop `restart_video()`; stop LPCM muxer + close video/audio fds on restart |
 | `src/drivers/wfd_lpcm_mux.py` | WFD LPCM mux — AOSP PIDs (video `0x1011`, PCR `0x1000`), `0x83` + AU framing |
-| `src/wfd/rtsp/handler.py` | Mode state; M16; LPCM-only → `0x83` mux (`FLUXCAST_WFD_FORCE_AAC=1` escapes) |
+| `src/wfd/rtsp/handler.py` | Mode state; M16; LPCM-only → `0x83` mux (`FLUXCAST_WFD_FORCE_AAC=1` escapes); PLAY schedules mid-session CSA; coalesce WFD IDR requests to one per GOP |
 | `src/wfd/probe.py` | Same LPCM negotiation as the live RTSP handler |
 | `src/wfd/rtsp/rtsp_server.py` | `restart_active_media()` for SIGUSR1 rebind |
 

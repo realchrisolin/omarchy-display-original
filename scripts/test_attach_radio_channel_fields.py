@@ -144,6 +144,39 @@ Station aa:bb:cc:dd:ee:ff (on p2p-wlp0s20-6)
         self.assertEqual(out["p2pChannel"], 6)
         self.assertEqual(out["p2pFreqSource"], "peer_listen")
 
+    def test_should_probe_p2p_peer_idle_skips(self):
+        # Idle / stale error must not sudo wpa_cli for lastPeerMac.
+        self.assertFalse(
+            self.mod.should_probe_p2p_peer(
+                {"phase": "idle", "running": False, "peer": "aa:bb"}
+            )
+        )
+        self.assertFalse(
+            self.mod.should_probe_p2p_peer(
+                {
+                    "phase": "error",
+                    "running": False,
+                    "linkUp": False,
+                    "peer": "aa:bb",
+                    "message": "Miracast link dropped after streaming started",
+                }
+            )
+        )
+
+    def test_should_probe_p2p_peer_live_or_go(self):
+        self.assertTrue(
+            self.mod.should_probe_p2p_peer({"phase": "streaming", "running": True})
+        )
+        self.assertTrue(
+            self.mod.should_probe_p2p_peer({"phase": "idle", "linkUp": True})
+        )
+        self.assertTrue(
+            self.mod.should_probe_p2p_peer(
+                {"phase": "idle", "running": False},
+                prelim={"p2pIface": "p2p-wlp0s20-6"},
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
