@@ -125,7 +125,7 @@ def _build_cqp_best_steps(*, async_depth: int, quality_floor: int = 1) -> list[d
                 "vaapiIQfactor": iqf,
                 "vaapiBitrate": br,
                 "bitrate": br,
-                "vaapiGop": 30,
+                "vaapiGop": 60,
                 "vaapiAsyncDepth": async_depth,
             }
         )
@@ -173,7 +173,7 @@ def _build_cbr_best_steps(
             "vaapiQuality": quality,
             "vaapiBitrate": br,
             "bitrate": br,
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": async_depth,
         }
         if async_depth == 1:
@@ -257,7 +257,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiIQfactor": "1.2",
             "vaapiBitrate": "28M",
             "bitrate": "28M",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 2,
         },
         "high": {
@@ -267,7 +267,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiIQfactor": "1.3",
             "vaapiBitrate": "14M",
             "bitrate": "14M",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 2,
         },
         "medium": {
@@ -277,7 +277,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiIQfactor": "1.1",
             "vaapiBitrate": "10M",
             "bitrate": "10M",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 2,
         },
         "low": {
@@ -287,7 +287,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiIQfactor": "1.0",
             "vaapiBitrate": "6M",
             "bitrate": "6M",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 2,
         },
     },
@@ -308,7 +308,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiBitrate": "28M",
             "bitrate": "28M",
             "vbvMultiplier": "1.0",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 1,
         },
         "high": {
@@ -318,7 +318,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiBitrate": "15M",
             "bitrate": "15M",
             "vbvMultiplier": "1.0",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 1,
         },
         "medium": {
@@ -328,7 +328,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiBitrate": "12M",
             "bitrate": "12M",
             "vbvMultiplier": "0.75",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 1,
         },
         "low": {
@@ -338,7 +338,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiBitrate": "8M",
             "bitrate": "8M",
             "vbvMultiplier": "0.5",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 1,
         },
     },
@@ -349,7 +349,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiQuality": "1",
             "vaapiBitrate": "28M",
             "bitrate": "28M",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 2,
         },
         "high": {
@@ -358,7 +358,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiQuality": "1",
             "vaapiBitrate": "16M",
             "bitrate": "16M",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 2,
         },
         "medium": {
@@ -367,7 +367,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiQuality": "4",
             "vaapiBitrate": "10M",
             "bitrate": "10M",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 2,
         },
         "low": {
@@ -376,7 +376,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
             "vaapiQuality": "6",
             "vaapiBitrate": "6M",
             "bitrate": "6M",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 2,
         },
     },

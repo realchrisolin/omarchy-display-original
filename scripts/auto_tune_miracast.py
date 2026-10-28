@@ -158,7 +158,7 @@ def empty_report() -> dict[str, Any]:
             "vaapiQuality": "5",
             "vaapiBitrate": "14M",
             "bitrate": "11M",
-            "vaapiGop": 30,
+            "vaapiGop": 60,
             "vaapiAsyncDepth": 2,
             "vbvMultiplier": "0.5",
             "p2pWifiInterface": "auto",  # auto | iface
