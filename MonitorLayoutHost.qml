@@ -14,6 +14,15 @@ import "LayoutModel.js" as LayoutModel
 Item {
   id: root
 
+  // Must not participate in the Display bar-slot size. A non-zero host here
+  // stretches the widget and steals drops on the left of the bar.
+  width: 0
+  height: 0
+  implicitWidth: 0
+  implicitHeight: 0
+  visible: false
+  clip: true
+
   property var shell: null
   property var manifest: null
 
