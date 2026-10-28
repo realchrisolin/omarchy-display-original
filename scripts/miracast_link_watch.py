@@ -57,22 +57,54 @@ def _p2p_tx_bytes() -> int | None:
     return total if found else None
 
 
-def _go_iface() -> str:
+def _p2p_data_ifaces_from_iw(text: str) -> list[tuple[str, str]]:
+    """Return (ifname, type) for live P2P-GO / P2P-client netdevs.
+
+    Skips p2p-dev-* (discovery wdev, not a group).
+    """
+    found: list[tuple[str, str]] = []
+    iface = ""
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if line.startswith("Interface "):
+            parts = line.split()
+            iface = parts[1] if len(parts) > 1 else ""
+            if iface.startswith("p2p-dev-"):
+                iface = ""
+        elif iface and line.startswith("type "):
+            parts = line.split()
+            t = parts[1] if len(parts) > 1 else ""
+            if t in ("P2P-GO", "P2P-client") and iface.startswith("p2p-"):
+                found.append((iface, t))
+            iface = ""
+    return found
+
+
+def _empty_station_dump_means_peer_left(role: str, dump: str) -> bool:
+    """Empty ``iw station dump`` is a left-peer signal only on P2P-GO.
+
+    On P2P-client the dump is the GO as a station; many drivers return
+    empty text while the association is still up.
+    """
+    if role != "P2P-GO":
+        return False
+    return not (dump or "").strip()
+
+
+def _p2p_data_ifaces() -> list[tuple[str, str]]:
     try:
         out = subprocess.check_output(["iw", "dev"], text=True, timeout=3.0)
     except Exception:
-        return ""
-    iface = ""
-    for raw in out.splitlines():
-        line = raw.strip()
-        if line.startswith("Interface p2p-"):
-            iface = line.split()[1]
-        elif iface and line.startswith("type "):
-            t = line.split()[1]
-            if t in ("P2P-GO", "P2P-client"):
-                return iface
-            iface = ""
-    return ""
+        return []
+    return _p2p_data_ifaces_from_iw(out)
+
+
+def _go_iface() -> str:
+    rows = _p2p_data_ifaces()
+    for iface, t in rows:
+        if t == "P2P-GO":
+            return iface
+    return rows[0][0] if rows else ""
 
 
 def _go_channel(iface: str) -> int | None:
@@ -247,11 +279,19 @@ def _soft_tx_counts_as_stall(
     *,
     stall_mbps: float,
 ) -> bool:
-    """Soft TX is a stall only if video fps is unhealthy (or TX≈0)."""
+    """Soft TX is a stall only if video fps is unhealthy (or TX≈0).
+
+    AAC Sender health has no ``video_frames`` (fps=None). Air TX above
+    hard-zero is the health signal; treating fps=? as dead plus
+    stall-mbps=3 made 2.4M QVBR (~1.3 Mbps) restart-capture and black
+    the TV.
+    """
     if mbps is None:
         return False
     if mbps < 0.15:
         return True
+    if vfps is None:
+        return False
     if mbps < stall_mbps and not _video_fps_healthy(vfps):
         return True
     return False
@@ -288,7 +328,11 @@ def _bufs_size_storm(chunk: str) -> bool:
 
 
 def _video_stall_logged(chunk: str) -> bool:
-    return "VIDEO_STALL" in chunk
+    """True if FluxCast logged VIDEO_STALL (ignore our own echo into cast.log)."""
+    for line in (chunk or "").splitlines():
+        if "VIDEO_STALL" in line and "[link-watch]" not in line:
+            return True
+    return False
 
 
 def _load_pick(plugin: Path):
@@ -515,6 +559,8 @@ def main(argv: list[str] | None = None) -> int:
     sv_applied_qp: int | None = None
     sv_last_apply_ts = 0.0
     sv_pending = None  # last BitrateDecision waiting for coalesce gate
+    fps_low_streak = 0  # 1080p60 stuck-under-4M ticks before dropping to p30
+    abr_preferred_mode = ""  # user 1080p60; ABR p30 must not overwrite restore
     bc_mod = None  # bitrate_controller module (load once)
     es_mod = None  # encode_strategy (DMA-BUF QVBR starve → pipe)
     starve_streak = 0
@@ -557,6 +603,9 @@ def main(argv: list[str] | None = None) -> int:
     # Bound UDP-during-rebind suppress so endless VIDEO_STALL loops can't leave
     # the UI stuck on "streaming" forever.
     udp_rebind_suppress_until = 0.0
+    # VIDEO_STALL / bufs_size: FluxCast rebinds capture. Do not ABR-demote
+    # that as air net_stall (fps=0) while the encoder is recycling.
+    capture_abr_hold_until = 0.0
     last_retry_pct: float | None = None
     last_station_dump = ""
     last_link_cap: float | None = None
@@ -596,9 +645,29 @@ def main(argv: list[str] | None = None) -> int:
             pass
         return False
 
+    def _in_sigusr1_grace() -> bool:
+        """True for --abr-grace seconds after watcher start (and ABR clock).
+
+        LG webOS TEARDOWN'd after three SIGUSR1s in ~50s. Grace must block
+        *every* restart-capture / set-bitrate apply, including urgent stalls.
+        """
+        now_g = time.time()
+        if now_g < capture_grace_until:
+            return True
+        if abr_ready_at > 0.0 and now_g < abr_ready_at:
+            return True
+        return False
+
     def _do_restart(reason: str, *, cooldown: float) -> bool:
         nonlocal last_restart, stall_streak, audio_band_streak, last_tx, tick
         now_r = time.time()
+        if _in_sigusr1_grace():
+            left = max(0.0, capture_grace_until - now_r)
+            _log(
+                cast_log,
+                f"{reason} deferred (SIGUSR1 grace {left:.0f}s left)",
+            )
+            return False
         if (now_r - last_restart) < cooldown:
             return False
         if _capture_paused():
@@ -664,6 +733,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if rebind_in_chunk:
             udp_rebind_suppress_until = time.time() + 20.0
+            capture_abr_hold_until = time.time() + 25.0
         if udp_errs >= max(1, args.udp_error_threshold):
             if time.time() < udp_rebind_suppress_until or time.time() < capture_grace_until:
                 _log(
@@ -702,7 +772,12 @@ def main(argv: list[str] | None = None) -> int:
         # AOSP never tears capture down while frames still encode. Soft/zero TX
         # with healthy sender fps is a counter glitch or quiet CBR interval —
         # not a stall (false TX≈0 storms after CBR 5M→3M rebinds).
-        if mbps is not None and mbps < 0.15 and not video_ok:
+        capture_hold = time.time() < capture_abr_hold_until
+        if capture_hold:
+            # Encoder rebind: TX/fps drop is not air stall.
+            stall_streak = 0
+            zero_tx_streak = 0
+        elif mbps is not None and mbps < 0.15 and not video_ok:
             stall_streak += 1
             zero_tx_streak += 1
         elif _soft_tx_counts_as_stall(mbps, vfps, stall_mbps=args.stall_mbps):
@@ -712,10 +787,13 @@ def main(argv: list[str] | None = None) -> int:
             stall_streak = 0
             zero_tx_streak = 0
 
-        # Audio-only band ≈ LPCM while video RTP is dead — require unhealthy fps.
+        # Audio-only band ≈ LPCM while video RTP is dead — require unhealthy
+        # fps. AAC has fps=None; 1.4–2.2 Mbps is normal QVBR video, not
+        # audio-only.
         if (
             mbps is not None
             and args.audio_band_low <= mbps <= args.audio_band_high
+            and vfps is not None
             and not video_ok
         ):
             audio_band_streak += 1
@@ -746,15 +824,12 @@ def main(argv: list[str] | None = None) -> int:
                 _log(
                     cast_log,
                     f"TX≈0 for {zero_tx_streak} ticks (mbps={mbps_s}) during "
-                    f"capture grace — one recovery restart, not stop",
+                    f"capture grace — not restarting (SIGUSR1 blocked)",
                 )
                 zero_tx_streak = 0
                 stall_streak = 0
-                if _do_restart(
-                    f"TX≈0 recovery during capture grace (mbps={mbps_s})",
-                    cooldown=max(30.0, float(args.restart_cooldown)),
-                ):
-                    continue
+                time.sleep(args.interval)
+                continue
             else:
                 _stop_session(
                     f"TX≈0 for {zero_tx_streak} ticks (mbps={mbps_s}) — sink gone"
@@ -804,16 +879,34 @@ def main(argv: list[str] | None = None) -> int:
 
         # --- retries / IDR / peer liveness (cheap-ish) ---
         tick += 1
-        go = _go_iface()
+        go = ""
+        go_role = ""
         rf_pain = False
-        if tick % max(1, args.retry_sample_every) == 0 and go:
+        sample_rf = tick % max(1, args.retry_sample_every) == 0
+        if sample_rf:
+            for iface, t in _p2p_data_ifaces():
+                if t == "P2P-GO":
+                    go, go_role = iface, t
+                    break
+                if not go:
+                    go, go_role = iface, t
+        if sample_rf and go:
             # Associated but idle peer (TV left) — P2P group can linger.
             dump = _station_dump(go)
             last_station_dump = dump or ""
             if dump:
                 last_signal_dbm = _station_signal_dbm_from_dump(dump)
                 last_link_cap = _station_tx_bitrate_mbps_from_dump(dump)
-            if not dump.strip():
+            csa_hold = False
+            try:
+                hold_p = Path("/tmp/fluxcast-mid-csa-hold")
+                if hold_p.is_file() and time.time() - hold_p.stat().st_mtime < 20:
+                    csa_hold = True
+            except OSError:
+                csa_hold = False
+            if csa_hold:
+                peer_inactive_streak = 0
+            elif _empty_station_dump_means_peer_left(go_role, dump):
                 peer_inactive_streak += 1
                 _log(
                     cast_log,
@@ -822,6 +915,9 @@ def main(argv: list[str] | None = None) -> int:
                 if peer_inactive_streak >= max(1, args.peer_inactive_ticks):
                     _stop_session("no P2P stations on GO (peer left)")
                     return 0
+            elif not dump.strip():
+                # P2P-client: empty dump is not "peer left".
+                peer_inactive_streak = 0
             else:
                 inactive_m = re.search(r"inactive time:\s*(\d+)\s*ms", dump)
                 inactive = int(inactive_m.group(1)) if inactive_m else None
@@ -871,7 +967,7 @@ def main(argv: list[str] | None = None) -> int:
                 last_pk, last_rt = stats[0], stats[1]
                 last_tx_failed = stats[2]
                 last_stats_t = now
-        elif tick % max(1, args.retry_sample_every) == 0 and not go:
+        elif sample_rf and not go:
             # Streaming status but no GO iface — reclaim.
             _stop_session("streaming status but no P2P GO/client iface")
             return 0
@@ -943,13 +1039,13 @@ def main(argv: list[str] | None = None) -> int:
                 # Do NOT treat FluxCast VIDEO_STALL / bufs_size log lines as ABR
                 # stalls — those already trigger capture rebind; counting them
                 # here caused a soft-QP demote spiral into UDP death.
-                abr_stalled = (
+                abr_stalled = (not capture_hold) and (
                     (stall_streak >= max(1, int(args.stall_ticks) - 1) and not video_ok)
                     or (
                         audio_band_streak >= max(1, int(args.audio_band_ticks) - 1)
                         and not video_ok
                     )
-                    or (mbps is not None and mbps < 0.15)
+                    or (mbps is not None and mbps < 0.15 and not video_ok)
                 )
                 rc_mode = str(settings.get("vaapiRcMode") or "CQP")
                 # Full QP/bitrate ladder — demote on retries / stalls / delivery
@@ -1063,6 +1159,15 @@ def main(argv: list[str] | None = None) -> int:
                         streak=starve_streak,
                     )
                     if hit:
+                        if _in_sigusr1_grace():
+                            _log(
+                                cast_log,
+                                f"encode-strategy starve deferred "
+                                f"(SIGUSR1 grace) ({sreason})",
+                            )
+                            starve_streak = 0
+                            time.sleep(args.interval)
+                            continue
                         _log(
                             cast_log,
                             f"encode-strategy: dmabuf-qvbr starve → fallback pipe ({sreason})",
@@ -1154,6 +1259,7 @@ def main(argv: list[str] | None = None) -> int:
                             if delivery_fail_tick
                             else 0,
                             retry_percent=None,
+                            idr_requests=int(idr) if idr else None,
                         )
                         d = bc_mod.decide(
                             sv_bc_state, sig, cfg, cooldown_ok=cooldown_ok
@@ -1170,15 +1276,67 @@ def main(argv: list[str] | None = None) -> int:
                             sv_applied_qp = cur_qp
                         if d.changed:
                             sv_pending = d
+                        applied_now = int(sv_applied_kbps or cur_kbps)
+                        cur_mode = str(settings.get("streamMode") or "")
+                        file_pref = str(settings.get("streamModePreferred") or "")
+                        if file_pref:
+                            abr_preferred_mode = file_pref
+                        elif not abr_preferred_mode and cur_mode:
+                            abr_preferred_mode = cur_mode
+                        # Stuck = observed air fill, not the QVBR setpoint
+                        # (setpoint can climb to 4M+ while encode still fills 2M).
+                        fill_kbps = applied_now
+                        if (
+                            mbps is not None
+                            and not (mbps < 0.15 and video_ok)
+                        ):
+                            fill_kbps = max(0, int(round(float(mbps) * 1000.0)))
+                        if in_abr_grace or capture_hold:
+                            want_mode = cur_mode
+                        else:
+                            want_mode, fps_low_streak = bc_mod.abr_stream_mode(
+                                applied_kbps=fill_kbps,
+                                stream_mode=cur_mode,
+                                preferred_mode=abr_preferred_mode or cur_mode,
+                                low_streak=fps_low_streak,
+                            )
+                        if (
+                            want_mode
+                            and cur_mode
+                            and want_mode != cur_mode
+                            and not in_abr_grace
+                            and not capture_hold
+                        ):
+                            _log(
+                                cast_log,
+                                f"abr fps {cur_mode}→{want_mode} at "
+                                f"{fill_kbps}kbps air (setpoint {applied_now}kbps)",
+                            )
+                            try:
+                                subprocess.run(
+                                    [ctl, "set-stream-mode", "--abr", want_mode],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=30.0,
+                                )
+                                subprocess.run(
+                                    [ctl, "restart-capture"],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=60.0,
+                                )
+                            except Exception as exc:
+                                _log(cast_log, f"abr fps change error: {exc}")
+                            capture_abr_hold_until = time.time() + 25.0
+                            last_dyn_change = now
+                            last_restart = now
+                            last_tx = None
+                            time.sleep(max(args.interval, 12.0))
+                            continue
                         # Samsung decide() stays hot; coalesce VAAPI SIGUSR1 applies.
                         if sv_pending is not None:
                             pend = sv_pending
-                            hard_fail = bool(delivery_fail_tick) or bool(
-                                last_tx_failed_delta and last_tx_failed_delta > 0
-                            )
-                            if in_abr_grace and not hard_fail and not bc_mod.is_urgent_apply(
-                                pend.reason
-                            ):
+                            if _in_sigusr1_grace() or in_abr_grace:
                                 if tick % 10 == 0:
                                     print(
                                         f"[link-watch] dynamic: hold:abr_grace "
@@ -1411,6 +1569,7 @@ def main(argv: list[str] | None = None) -> int:
                 dyn_state = None
         except Exception as exc:
             _log(cast_log, f"dynamic skipped: {exc}")
+        if idr >= 2:
             _log(cast_log, f"IDR burst count={idr} since last check")
 
         # --- rare score + optional CSA ---

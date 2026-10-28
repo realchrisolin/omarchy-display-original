@@ -12,10 +12,10 @@ Derived from ``libremotedisplay_wfd.so`` + live dig (S23→hotyeah, 1080p)::
 **Not** used for ``encodeStrategy=performance`` (CQP ladder in
 ``dynamic_encode.py``).
 
-Without sink RTCP (hotyeah RTCP port 0), we do **not** invent LOSS from
-iw retry%%. Demote only on NetworkStall (fps/sender) or hard tx_failed
-delivery. Climb init→max when healthy. QP fill toward the encode setpoint
-so VAAPI QVBR actually spends bits (CAC-in-VBR).
+Without sink RTCP, we do **not** invent LOSS from iw retry%%. Demote on
+NetworkStall (fps/sender), hard tx_failed, or a sink WFD IDR burst
+(decoder starvation). Climb init→max when healthy. QP fill toward the
+encode setpoint so VAAPI QVBR actually spends bits (CAC-in-VBR).
 
 Pure functions / small state object — no I/O.
 """
@@ -29,6 +29,8 @@ from typing import Optional
 # Samsung BitrateController (live dig, resolution=2 / 1080p), values in kbps.
 DEFAULT_INIT_KBPS = 8_192  # 8 * 1024
 DEFAULT_MIN_KBPS = 2_048  # 2 * 1024
+# Decoder starvation (IDR / tx_failed): keep a decodeable stream below Smart View min.
+STALL_MIN_KBPS = 800
 DEFAULT_MAX_KBPS = 14_336  # 14 * 1024
 DEFAULT_QP_MIN = 15
 DEFAULT_QP_MAX = 44
@@ -40,6 +42,8 @@ LOSS_FRACTION_CLEAR = 0.005
 
 DECREASE_FACTOR = 0.80
 INCREASE_FACTOR = 1.10
+# Below Samsung init, climb faster (still capped at init this step).
+INCREASE_TOWARD_INIT_FACTOR = 1.25
 STALL_DECREASE_FACTOR = 0.65
 
 # Outer safety vs iw MCS (Samsung max ≪ MCS on HT20; rarely binds).
@@ -49,14 +53,26 @@ CAPACITY_FRAC = 0.75
 FILL_LOW_FRAC = 0.55
 QP_STEP = 1
 QP_SHARPEN_STREAK = 2
+# Stall recovery parks at qp_max (44). Healthy ticks must walk back to qmin
+# with Δqp≥2 so coalesce actually SIGUSR1s (QP±1 is hold:qp_only).
+QP_RECOVER_HI = 6  # qp ≥ 36 (stall floor)
+QP_RECOVER_MID = 4  # qp ≥ 28
+QP_RECOVER_LO = 2
 
 # SIGUSR1 coalesce (VAAPI cannot live-setParameters).
 APPLY_MIN_QP_DELTA = 2
 APPLY_MIN_KBPS_FRAC = 0.15
+# Samsung increaseUDPBitrate is 10%; 15% coalesce never let climbs apply.
+APPLY_CLIMB_KBPS_FRAC = 0.08
 APPLY_MIN_INTERVAL_S = 45.0
 APPLY_FLUSH_INTERVAL_S = 120.0
 APPLY_FLUSH_QP_DELTA = 2
 APPLY_FLUSH_KBPS_FRAC = 0.15
+
+# 1080p60 at <4 Mbps looks worse than 1080p30. Restore 60 fps once encode recovers.
+FPS60_DROP_KBPS = 4_000
+FPS60_RESTORE_KBPS = 7_000
+FPS60_DROP_TICKS = 3
 
 
 @dataclass
@@ -94,6 +110,7 @@ class LinkSignals:
     air_tx_mbps: Optional[float] = None
     tx_failed_delta: Optional[int] = None  # hard delivery fail
     retry_percent: Optional[float] = None  # ignored for demote (not Smart View)
+    idr_requests: Optional[int] = None  # sink wfd_idr_request count this tick
 
 
 @dataclass(frozen=True)
@@ -144,8 +161,16 @@ def desired_fill_mbps(kbps: int, capacity_mbps: Optional[float]) -> float:
     return target
 
 
-def _clamp_kbps(kbps: int, cfg: BitrateConfig, capacity_mbps: Optional[float]) -> int:
+def _clamp_kbps(
+    kbps: int,
+    cfg: BitrateConfig,
+    capacity_mbps: Optional[float],
+    *,
+    stall: bool = False,
+) -> int:
     lo, hi = int(cfg.min_kbps), int(cfg.max_kbps)
+    if stall:
+        lo = min(lo, STALL_MIN_KBPS)
     if capacity_mbps is not None and capacity_mbps > 1.0:
         hi = min(hi, int(capacity_mbps * 1000 * CAPACITY_FRAC))
         hi = max(hi, lo)
@@ -156,6 +181,18 @@ def _clamp_qp(qp: int, cfg: BitrateConfig) -> int:
     return max(int(cfg.qp_min), min(int(cfg.qp_max), int(qp)))
 
 
+def _qp_recover_step(qp: int, cfg: BitrateConfig) -> int:
+    """Drop QP toward qmin. Bigger steps from stall-max so one apply is worth it."""
+    span = int(qp) - int(cfg.qp_min)
+    if span <= 0:
+        return 0
+    if qp >= 36:
+        return min(QP_RECOVER_HI, span)
+    if qp >= 28:
+        return min(QP_RECOVER_MID, span)
+    return min(QP_RECOVER_LO, span)
+
+
 def _rtcp_loss_fraction(sig: LinkSignals) -> Optional[float]:
     """Real RTCP RR fraction lost only — never iw retry%."""
     if sig.loss_fraction is None:
@@ -164,13 +201,18 @@ def _rtcp_loss_fraction(sig: LinkSignals) -> Optional[float]:
 
 
 def _is_stall(sig: LinkSignals) -> bool:
+    """Air/decoder stall only. fps=0 is capture death (VIDEO_STALL rebind), not NetStall."""
     if sig.stalled:
         return True
     # Hard delivery failure (tx_failed) ≈ NetworkStall / path death.
     if sig.tx_failed_delta is not None and int(sig.tx_failed_delta) > 0:
         return True
+    # Sink WFD IDR burst = decoder starved (not iw retry%).
+    if sig.idr_requests is not None and int(sig.idr_requests) >= 2:
+        return True
     if sig.video_fps is not None:
         v = float(sig.video_fps)
+        # Sagging but still encoding. fps=0 / tiny fps is capture stall.
         if 5.0 <= v < 28.0:
             return True
     return False
@@ -237,11 +279,18 @@ def decide(
 
     # NetworkStall / hard delivery — aggressive decrease (Samsung path).
     if stall:
-        nxt = _clamp_kbps(int(kbps * STALL_DECREASE_FACTOR), cfg, sig.link_capacity_mbps)
+        nxt = _clamp_kbps(
+            int(kbps * STALL_DECREASE_FACTOR),
+            cfg,
+            sig.link_capacity_mbps,
+            stall=True,
+        )
         nqp = _clamp_qp(qp + QP_STEP, cfg)
         why = f"net_stall:fps={sig.video_fps}"
         if sig.tx_failed_delta and int(sig.tx_failed_delta) > 0:
             why = f"net_stall:tx_failed={sig.tx_failed_delta}"
+        elif sig.idr_requests and int(sig.idr_requests) >= 2:
+            why = f"net_stall:idr={sig.idr_requests}"
         return _decision(
             kbps=nxt,
             qp=nqp,
@@ -284,16 +333,31 @@ def decide(
 
     good += 1
 
-    # No-loss climb toward Samsung max (init → max).
+    # No-loss climb toward Samsung max (init → max), and walk QP off stall-max.
     at_ceiling = kbps >= _clamp_kbps(10**9, cfg, sig.link_capacity_mbps)
-    if good >= 3 and not at_ceiling:
-        nxt = _clamp_kbps(int(kbps * INCREASE_FACTOR), cfg, sig.link_capacity_mbps)
-        if nxt != kbps:
+    if good >= 3:
+        nxt = kbps
+        if not at_ceiling:
+            if kbps < int(cfg.init_kbps):
+                toward = int(kbps * INCREASE_TOWARD_INIT_FACTOR)
+                nxt = min(int(cfg.init_kbps), max(toward, int(kbps * INCREASE_FACTOR)))
+            else:
+                nxt = int(kbps * INCREASE_FACTOR)
+            nxt = _clamp_kbps(nxt, cfg, sig.link_capacity_mbps)
+        step = _qp_recover_step(qp, cfg)
+        nqp = _clamp_qp(qp - step, cfg) if step else qp
+        if nxt != kbps or nqp != qp:
+            if nxt != kbps and nqp != qp:
+                why = f"no_loss_increase+qp_recover qp{qp}→{nqp}"
+            elif nqp != qp:
+                why = f"qp_recover qp{qp}→{nqp}"
+            else:
+                why = "no_loss_increase"
             return _decision(
                 kbps=nxt,
-                qp=qp,
+                qp=nqp,
                 changed=True,
-                reason="no_loss_increase",
+                reason=why,
                 cfg=cfg,
                 good=0,
                 bad=0,
@@ -364,6 +428,13 @@ def is_urgent_apply(reason: str) -> bool:
     return str(reason or "").startswith("net_stall:")
 
 
+def urgent_interval_s(reason: str) -> float:
+    """Decoder IDR storm needs a faster encode drop than tx_failed."""
+    if "idr=" in str(reason or ""):
+        return 8.0
+    return min(30.0, APPLY_MIN_INTERVAL_S)
+
+
 def should_apply_encode(
     *,
     applied_kbps: int,
@@ -378,21 +449,32 @@ def should_apply_encode(
     dq = abs(int(desired_qp) - int(applied_qp))
     base = max(1, int(applied_kbps))
     dfrac = abs(int(desired_kbps) - int(applied_kbps)) / float(base)
-    elapsed = float(now) - float(last_apply_ts or 0.0)
+    raw_elapsed = float(now) - float(last_apply_ts or 0.0)
     first = not last_apply_ts or last_apply_ts <= 0.0
+    # Wall-clock `now` minus unset last_apply_ts is ~epoch; don't print 1e9s waits.
+    elapsed = 0.0 if first else max(0.0, raw_elapsed)
+    climb = int(desired_kbps) > int(applied_kbps)
 
     if dq == 0 and dfrac < 0.01:
         return False, "hold:noop"
 
-    if dfrac < 0.01 and dq < APPLY_MIN_QP_DELTA:
+    recover = int(desired_qp) < int(applied_qp) and str(reason or "").startswith(
+        "qp_recover"
+    )
+    # QP+1 demotes stay coalesced. QP recovery (toward qmin) may apply at Δqp=1
+    # so the last step 16→15 is not stuck behind hold:qp_only.
+    if dfrac < 0.01 and dq < APPLY_MIN_QP_DELTA and not recover:
         return (
             False,
             f"hold:qp_only Δqp={dq} (need ≥{APPLY_MIN_QP_DELTA})",
         )
 
     if is_urgent_apply(reason):
-        urgent_interval = min(30.0, APPLY_MIN_INTERVAL_S)
-        if dq >= APPLY_MIN_QP_DELTA or dfrac >= APPLY_MIN_KBPS_FRAC:
+        urgent_interval = urgent_interval_s(reason)
+        # Stall demotes must apply even when Δkbps is just under 15%
+        # (2400→2048 is ~14.7% and Δqp=1). Climbs still use the 15%/Δqp≥2 gate.
+        demote = int(desired_kbps) < int(applied_kbps)
+        if demote or dq >= 1 or dfrac >= APPLY_MIN_KBPS_FRAC:
             if first or elapsed >= urgent_interval:
                 return True, f"urgent:{reason}"
             return (
@@ -400,6 +482,31 @@ def should_apply_encode(
                 f"hold:urgent_cooldown {elapsed:.0f}/{urgent_interval:.0f}s",
             )
         return False, f"hold:urgent_small_delta Δqp={dq} Δkbps={dfrac:.0%}"
+
+    if recover and dq >= 1:
+        if first or elapsed >= APPLY_MIN_INTERVAL_S:
+            return (
+                True,
+                f"ready:qp_recover Δqp={dq} wait={elapsed:.0f}s",
+            )
+        return (
+            False,
+            f"hold:min_interval {elapsed:.0f}/{APPLY_MIN_INTERVAL_S:.0f}s "
+            f"(qp_recover Δqp={dq})",
+        )
+
+    # 10% Samsung climbs must apply after the interval (15% gate blocked them).
+    if climb and dfrac >= APPLY_CLIMB_KBPS_FRAC:
+        if first or elapsed >= APPLY_MIN_INTERVAL_S:
+            return (
+                True,
+                f"ready:climb Δqp={dq} Δkbps={dfrac:.0%} wait={elapsed:.0f}s",
+            )
+        return (
+            False,
+            f"hold:min_interval {elapsed:.0f}/{APPLY_MIN_INTERVAL_S:.0f}s "
+            f"(climb Δkbps={dfrac:.0%})",
+        )
 
     if dq >= APPLY_MIN_QP_DELTA or dfrac >= APPLY_MIN_KBPS_FRAC:
         if first or elapsed >= APPLY_MIN_INTERVAL_S:
@@ -425,6 +532,46 @@ def should_apply_encode(
         False,
         f"hold:coalesce Δqp={dq} Δkbps={dfrac:.0%} wait={elapsed:.0f}s",
     )
+
+
+def parse_stream_mode(mode: str) -> tuple[int, int, int]:
+    """'1920x1080p60' → (1920, 1080, 60). Defaults to 1080p60."""
+    import re
+
+    m = re.fullmatch(r"(\d+)x(\d+)p(\d+)", str(mode or "").strip())
+    if not m:
+        return 1920, 1080, 60
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def abr_stream_mode(
+    *,
+    applied_kbps: int,
+    stream_mode: str,
+    preferred_mode: str,
+    low_streak: int,
+) -> tuple[str, int]:
+    """Drop 1080p60 → 1080p30 when encode is stuck under 4 Mbps.
+
+    Preferred 60 fps is restored at ≥7 Mbps. Resolution is unchanged.
+    """
+    w, h, cur_fps = parse_stream_mode(stream_mode)
+    pw, ph, pref_fps = parse_stream_mode(preferred_mode or stream_mode)
+    if pref_fps < 60 or max(h, ph) < 1080:
+        return f"{w}x{h}p{cur_fps}", 0
+    kbps = int(applied_kbps)
+    streak = int(low_streak or 0)
+    if cur_fps >= 60:
+        if kbps < FPS60_DROP_KBPS:
+            streak += 1
+            if streak >= FPS60_DROP_TICKS:
+                return f"{w}x{h}p30", 0
+            return f"{w}x{h}p{cur_fps}", streak
+        return f"{w}x{h}p{cur_fps}", 0
+    if kbps >= FPS60_RESTORE_KBPS:
+        rw, rh = (pw, ph) if ph >= 1080 else (w, h)
+        return f"{rw}x{rh}p60", 0
+    return f"{w}x{h}p30", 0
 
 
 def kbps_to_ffmpeg(kbps: int) -> str:

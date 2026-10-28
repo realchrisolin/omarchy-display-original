@@ -41,13 +41,13 @@ Required encode flags (FluxCast + custom wf-recorder):
 | Samsung | Ours |
 |---------|------|
 | RTCP RR fraction lost | Only if real RR is available — **iw retry% is not used** |
-| NetworkStall | sender fps sag / hard `tx_failed` |
-| MediaCodec live setBitrate | coalesced SIGUSR1 + DMA sticky (`prepare_dmabuf_settings`) |
+| NetworkStall | sender fps sag / hard `tx_failed` / sink WFD IDR burst (decoder starved); stall floor 800 kbps (below Smart View 2M) |
+| MediaCodec live setBitrate | coalesced SIGUSR1 + DMA sticky (`prepare_dmabuf_settings`); stall demotes apply even if Δkbps &lt; 15% / Δqp=1 |
 | CAC / quality VBR | `h264_vaapi` **QVBR** + qmin/qmax + minrate floor |
 | QP min/max | `FLUXCAST_WFD_VAAPI_QMIN` / `QMAX` (not fixed `qp=` on QVBR) |
 
 ## Also present in Samsung (not all ported)
 - `dropAFrame` / `setFrameSkip` (wf-recorder already drops on backlog)
-- `requestIDRFrame` (we stamp + wait for GOP)
+- `requestIDRFrame` (stamp + at most one IDR per GOP; burst → stall demote)
 - Resolution downsize to 720p under stress
 - Recovery RTP / TCP switch

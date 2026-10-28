@@ -54,13 +54,20 @@ class LinkWatchStallGateTest(unittest.TestCase):
         self.assertTrue(
             self.m._soft_tx_counts_as_stall(2.0, 16.0, stall_mbps=3.0)
         )
-        self.assertTrue(
+        # AAC: no video_frames (fps=None). Moving TX is not a stall.
+        self.assertFalse(
             self.m._soft_tx_counts_as_stall(2.0, None, stall_mbps=3.0)
+        )
+        self.assertFalse(
+            self.m._soft_tx_counts_as_stall(1.3, None, stall_mbps=3.0)
         )
 
     def test_near_zero_tx_is_stall(self):
         self.assertTrue(
             self.m._soft_tx_counts_as_stall(0.05, 30.0, stall_mbps=3.0)
+        )
+        self.assertTrue(
+            self.m._soft_tx_counts_as_stall(0.05, None, stall_mbps=3.0)
         )
 
     def test_recent_video_fps_from_log(self):
@@ -79,6 +86,65 @@ class LinkWatchStallGateTest(unittest.TestCase):
         self.assertIsNotNone(fps)
         # 150 frames / 5 s = 30 fps
         self.assertAlmostEqual(fps, 30.0, places=1)
+
+    def test_video_stall_ignores_link_watch_echo(self):
+        echo = (
+            "[link-watch] VIDEO_STALL in cast.log "
+            "(FluxCast handles rebind; link-watch not double-restarting)\n"
+        )
+        self.assertFalse(self.m._video_stall_logged(echo))
+        real = "2026-10-27T21:00:00 [FluxCast WFD Media] VIDEO_STALL — rebind\n"
+        self.assertTrue(self.m._video_stall_logged(real))
+        self.assertTrue(self.m._video_stall_logged(echo + real))
+
+
+class P2pIfaceParseTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.m = _load()
+
+    def test_go_preferred_over_device(self):
+        text = """
+phy#0
+	Interface p2p-dev-wlp0s20
+		addr aa:bb:cc:dd:ee:ff
+		type P2P-device
+	Interface p2p-wlp0s20-20
+		addr aa:bb:cc:dd:ee:00
+		type P2P-GO
+	Interface wlp0s20f3
+		addr aa:bb:cc:dd:ee:ff
+		type managed
+"""
+        rows = self.m._p2p_data_ifaces_from_iw(text)
+        self.assertEqual(rows, [("p2p-wlp0s20-20", "P2P-GO")])
+
+    def test_client_group(self):
+        text = """
+	Interface p2p-wlp0s20-8
+		type P2P-client
+	Interface p2p-dev-wlp0s20
+		type P2P-device
+"""
+        rows = self.m._p2p_data_ifaces_from_iw(text)
+        self.assertEqual(rows, [("p2p-wlp0s20-8", "P2P-client")])
+
+    def test_empty_dump_peer_left_only_on_go(self):
+        self.assertTrue(
+            self.m._empty_station_dump_means_peer_left("P2P-GO", "")
+        )
+        self.assertTrue(
+            self.m._empty_station_dump_means_peer_left("P2P-GO", "  \n")
+        )
+        self.assertFalse(
+            self.m._empty_station_dump_means_peer_left("P2P-client", "")
+        )
+        self.assertFalse(
+            self.m._empty_station_dump_means_peer_left(
+                "P2P-GO",
+                "Station aa:bb:cc:dd:ee:ff\n\tinactive time:\t10 ms\n",
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -25,14 +25,25 @@ class EncodeStrategyTest(unittest.TestCase):
         self.assertEqual(s["bitrate"], "8M")
         self.assertEqual(s["vaapiBitrate"], "8M")
         self.assertEqual(s["encodeWfdBitrateMbps"], 8.0)
+        self.assertEqual(s["vbvMultiplier"], "2.0")
+        self.assertEqual(s["vaapiIQfactor"], "1.0")
         self.assertTrue(es.uses_sv_abr(s))
+
+    def test_latency_first_vbv_from_bitrate_and_air(self):
+        self.assertEqual(es.latency_first_vbv_multiplier(2.4), 0.25)
+        self.assertEqual(es.latency_first_vbv_multiplier(8.0), 0.25)
+        self.assertEqual(es.latency_first_vbv_multiplier(2.4, air_mbps=30.0), 0.25)
+        self.assertEqual(es.latency_first_vbv_multiplier(8.0, air_mbps=10.0), 0.5)
+        self.assertEqual(es.latency_first_vbv_multiplier(1.0), 0.5)
 
     def test_smartview_keeps_existing_bitrate(self):
         s: dict = {"encodeProfile": "best", "bitrate": "14M", "vaapiBitrate": "14M", "encodeWfdBitrateMbps": 14.0}
+        s["vaapiIQfactor"] = "1.3"
         es.apply_to_settings(s, "smartview")
         self.assertEqual(s["bitrate"], "14M")
         self.assertEqual(s["vaapiBitrate"], "14M")
         self.assertEqual(s["encodeWfdBitrateMbps"], 14.0)
+        self.assertEqual(s["vaapiIQfactor"], "1.0")
 
     def test_performance_forces_cqp_dmabuf(self):
         s = {
@@ -71,6 +82,20 @@ class EncodeStrategyTest(unittest.TestCase):
         self.assertEqual(s["vaapiRcMode"], "QVBR")
         self.assertEqual(s["bitrate"], "8M")
         self.assertEqual(s["encodeWfdBitrateMbps"], 8.0)
+        self.assertEqual(s["vaapiGop"], 60)
+        self.assertEqual(s["vbvMultiplier"], "2.0")
+        self.assertEqual(s["vaapiIQfactor"], "1.0")
+
+    def test_prepare_clears_cqp_high_iqfactor_when_pinned(self):
+        s = {
+            "encodeStrategy": "smartview",
+            "encodeStrategyPinnedEngine": True,
+            "captureEncode": "dmabuf",
+            "vaapiIQfactor": "1.3",
+        }
+        es.prepare_dmabuf_settings(s)
+        self.assertEqual(s["vaapiIQfactor"], "1.0")
+        self.assertEqual(s["captureEncode"], "dmabuf")
 
     def test_starve_detector_triggers_after_streak(self):
         streak = 0

@@ -11,10 +11,54 @@ Orthogonal to RENDER ENGINE (`captureEncode`) and PRESET QUALITY (`encodeProfile
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 STRATEGIES = ("smartview", "performance")
 DEFAULT_STRATEGY = "smartview"
+
+
+def bitrate_to_mbps(text: Any) -> float:
+    raw = str(text or "").strip()
+    m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*([KkMmGg])?", raw)
+    if not m:
+        return 0.0
+    v = float(m.group(1))
+    u = (m.group(2) or "M").upper()
+    if u == "G":
+        return v * 1000.0
+    if u == "K":
+        return v / 1000.0
+    return v
+
+
+# QVBR quality-first HRD (~2 s of peak). Intel QVBR underspends at 0.25 s.
+QVBR_VBV_MULTIPLIER = 2.0
+# 1.0 = I-frames same quantizer as P. CQP High's 1.3 coarsens IDR and leaked
+# into QVBR via encodeProfileEffective=high.
+QVBR_I_QFACTOR = "1.0"
+
+
+def latency_first_vbv_multiplier(
+    encode_mbps: float,
+    air_mbps: float | None = None,
+) -> float:
+    """HRD window in seconds for CQP/CBR. QVBR uses QVBR_VBV_MULTIPLIER.
+
+    Intel low-delay AVC is 0.25 s. Tight air (capacity < 2× encode) uses
+    0.5 s.
+    """
+    enc = max(0.0, float(encode_mbps or 0.0))
+    if air_mbps is not None and float(air_mbps) > 0 and enc > 0:
+        headroom = float(air_mbps) / enc
+        if headroom < 2.0:
+            return 0.5
+        if headroom < 4.0:
+            return 0.35
+        return 0.25
+    if enc >= 2.0:
+        return 0.25
+    return 0.5
 
 # Starve detector: true Intel DMA BRC death is ~0.5–3 Mbps absolute.
 # Do NOT use "% of maxrate" — QVBR on quiet 1080p60 UI often sits at 4–8 Mbps
@@ -60,6 +104,8 @@ def prepare_dmabuf_settings(settings: dict[str, Any]) -> dict[str, Any]:
         raise TypeError("settings must be a dict")
     strat = normalize_strategy(settings.get("encodeStrategy"))
     settings["encodeStrategyFallback"] = ""
+    if strat == "smartview":
+        settings["vaapiIQfactor"] = QVBR_I_QFACTOR
     if strat == "smartview" and not settings.get("encodeStrategyPinnedEngine"):
         settings["captureEncode"] = "dmabuf"
         settings["vaapiRcMode"] = "QVBR"
@@ -78,8 +124,9 @@ def prepare_dmabuf_settings(settings: dict[str, Any]) -> dict[str, Any]:
         if settings.get("encodeWfdBitrateMbps") is None:
             settings["encodeWfdBitrateMbps"] = 8.0
         settings["vaapiAsyncDepth"] = 1
-        # QVBR needs ~2s VBV or Intel undershoots to ~3 Mbps despite b=.
-        settings["vbvMultiplier"] = "2.0"
+        sm = str(settings.get("streamMode") or "")
+        settings["vaapiGop"] = 30 if ("p30" in sm and "p60" not in sm) else 60
+        settings["vbvMultiplier"] = f"{QVBR_VBV_MULTIPLIER:.1f}"
     return {
         "encodeStrategy": strat,
         "captureEncode": settings.get("captureEncode"),
@@ -129,8 +176,8 @@ def apply_to_settings(
             settings["vaapiBitrate"] = settings.get("bitrate") or "8M"
         if settings.get("encodeWfdBitrateMbps") is None:
             settings["encodeWfdBitrateMbps"] = 8.0
-        # QVBR needs ~2s VBV or Intel undershoots to ~3 Mbps despite b=.
-        settings["vbvMultiplier"] = "2.0"
+        settings["vbvMultiplier"] = f"{QVBR_VBV_MULTIPLIER:.1f}"
+        settings["vaapiIQfactor"] = QVBR_I_QFACTOR
         if retarget_engine and not settings.get("encodeStrategyPinnedEngine"):
             # Attempt DMA-BUF first; starve watchdog may flip to vaapi.
             settings["captureEncode"] = "dmabuf"
