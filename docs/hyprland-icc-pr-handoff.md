@@ -55,8 +55,21 @@ Patch copies in this repo:
 Local install used for validation:
 
 - Prefix: `~/.local/hyprland-icc-fix/`
-- UWSM: `~/.config/uwsm/env.d/50-hyprland-icc-fix`
+- UWSM: `~/.config/uwsm/env.d/50-hyprland-icc-fix` (prepends that `bin/` so `start-hyprland` `execvp`s it)
 - Toggle: `~/.local/hyprland-icc-fix/toggle-icc-fix.sh {on,off,status}`
+- Running binary (2026-09-21): commit `8bd33cea` on `fix/icc-screenshare-schedule-every-share`, tag `v0.56.0-191-g8bd33cea`. Not Arch `hyprland 0.56.2-2`.
+
+### Two different Hyprlands
+
+The ICC patch is a few lines in `ScreenshareFrame.cpp`. It does **not** add Lua IPC.
+
+| | Arch `/usr/bin/Hyprland` 0.56.2 | This prefix (`8bd33cea`, `v0.56.0-191`) |
+|--|----------------------------------|------------------------------------------|
+| Config / dispatch | Classic `hyprctl` | Lua: `hl.dsp.exec_cmd`, `hl.dsp.focus`, `hl.dsp.cursor.move` |
+| Nested workspace JSON | `{"id": N, "name": "…"}` | `{"address","type","name"}` — **no `.id`** |
+| What breaks | Omarchy `omarchy-capture-region` works | Smart screenshot `jq` dies (`"null" \| tonumber`); slurp exits immediately |
+
+Hyprland `main` has since started emitting an optional numeric `"id"` again. Omarchy `quattro` `bin/omarchy-capture-region` still queries only `.id` ([omacom/omarchy#11903](https://github.com/omacom/omarchy/issues/11903), closed not-planned, same failure). Do not treat a screenshot failure on this prefix as an ICC-patch bug.
 
 ### omarchy-miracast packaging
 
