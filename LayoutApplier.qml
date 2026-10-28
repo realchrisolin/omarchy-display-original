@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import Quickshell.Io
 import "LayoutModel.js" as LayoutModel
 
@@ -13,6 +14,7 @@ QtObject {
   id: root
 
   required property string orderPath
+  readonly property string reloadLuaPath: Quickshell.env("HOME") + "/.config/hypr/monitors-layout.lua"
   // Also carry out the saved laptop-screen mode (withExternal) through
   // Omarchy's commands. Only the service does, so the panel's applier cannot
   // run them a second time in parallel.
@@ -81,6 +83,8 @@ QtObject {
           return
         }
 
+        root._persistReloadLua(monitors, layout)
+
         var positions = LayoutModel.computePositions(monitors, layout.order, layout.stack)
         // Only unplugged outputs are parked; a connected but disabled one (the
         // laptop screen in external-only mode) is left alone.
@@ -107,6 +111,25 @@ QtObject {
   property Process modeProc: Process {
     stdout: StdioCollector { waitForEnd: true }
     onRunningChanged: if (!running) root._finish()
+  }
+
+  function _persistReloadLua(monitors, layout) {
+    var lua = LayoutModel.physicalReloadLua(monitors, layout)
+    if (!luaPersist.running) {
+      luaPersist.command = ["python3", "-c",
+        "from pathlib import Path\nimport sys\np=Path(sys.argv[1]); t=sys.argv[2]\n"
+        + "p.parent.mkdir(parents=True, exist_ok=True)\n"
+        + "if not p.exists() or p.read_text()!=t: p.write_text(t)\n",
+        root.reloadLuaPath, lua]
+      luaPersist.running = true
+    }
+  }
+
+  property Process orderPersist: Process {
+    stdout: StdioCollector { waitForEnd: true }
+  }
+  property Process luaPersist: Process {
+    stdout: StdioCollector { waitForEnd: true }
   }
 
   property Process evalProc: Process {

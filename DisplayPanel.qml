@@ -378,8 +378,8 @@ Panel {
   }
 
   function setScale(scale) {
-    // arrangement: a scale kept in the properties window would override this.
-    arrangement.forgetSetting(root.focusedMonitor, "scale")
+    var cleaned = root.effectiveScale(scale)
+    arrangement.rememberSettings(root.focusedMonitor, { scale: Number(cleaned) })
     actionProc.command = ["bash", "-c", "omarchy-hyprland-monitor-scaling " + scale]
     if (!actionProc.running) actionProc.running = true
   }

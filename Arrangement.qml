@@ -167,6 +167,20 @@ Column {
 
   // Stop keeping a setting for an output, e.g. when the panel's SCALE row
   // changes the scale in monitors.lua, which should then win.
+  function rememberSettings(output, settings) {
+    for (var i = 0; i < tiles.length; i++) {
+      if (tiles[i].name !== output) continue
+      orderFile.saveSettings(tiles[i].key, settings)
+      return
+    }
+    var shared = LayoutModel.sharedDescriptions(monitors)
+    for (var j = 0; j < monitors.length; j++) {
+      if (String(monitors[j].name) !== output) continue
+      orderFile.saveSettings(LayoutModel.monitorKey(monitors[j], shared), settings)
+      return
+    }
+  }
+
   function forgetSetting(output, field) {
     for (var i = 0; i < tiles.length; i++) {
       if (tiles[i].name !== output) continue

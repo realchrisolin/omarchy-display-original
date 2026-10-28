@@ -387,6 +387,36 @@ test("pendingSettings ignores disabled monitors and entries with no saved settin
   assert.deepEqual(Model.pendingSettings([dell("DP-1", 0, "S1")], { order: [], monitors: {} }), [])
 })
 
+test("physicalReloadLua writes scale/transform for hardware outputs and skips Miracast", () => {
+  const lua = Model.physicalReloadLua([laptop, portrait, virt], {
+    order: [Model.monitorKey(laptop), Model.monitorKey(portrait)],
+    monitors: {
+      [Model.monitorKey(portrait)]: { scale: 1.25, transform: 2 }
+    }
+  })
+  assert.match(lua, /output = "eDP-1"/)
+  assert.match(lua, /output = "DP-2"/)
+  assert.match(lua, /scale = 1\.25/)
+  assert.match(lua, /transform = 2/)
+  assert.equal(/output = "persistent-miracast"/.test(lua), false)
+  assert.equal(/output = "HEADLESS/.test(lua), false)
+})
+
+test("snapshotPhysicalSettings does not overwrite saved scale/rotation with live", () => {
+  const layout = {
+    order: [],
+    monitors: {
+      "gone TV": { scale: 1.6, transform: 1 },
+      [Model.monitorKey(portrait)]: { scale: 1.25, transform: 2, vrr: 2 }
+    }
+  }
+  const next = Model.snapshotPhysicalSettings([portrait], layout)
+  assert.equal(next.monitors["gone TV"].scale, 1.6)
+  assert.equal(next.monitors[Model.monitorKey(portrait)].scale, 1.25)
+  assert.equal(next.monitors[Model.monitorKey(portrait)].transform, 2)
+  assert.equal(next.monitors[Model.monitorKey(portrait)].vrr, 2)
+})
+
 test("settingsToLua joins rules with newlines", () => {
   const pending = [
     { name: "eDP-1", settings: { scale: 2 } },
