@@ -250,6 +250,122 @@ def list_radios() -> list[dict[str, Any]]:
     return radios
 
 
+def _is_usb_iface(name: str) -> bool:
+    """udev USB wifi (…uN) or an iface name that contains 'usb'."""
+    n = name or ""
+    return bool(re.search(r"u[0-9]+$", n)) or "usb" in n.lower()
+
+
+def parse_p2p_go_ifaces(iw_text: str) -> list[str]:
+    """P2P-GO data ifaces from ``iw dev`` (not ``p2p-dev-*``)."""
+    gos: list[str] = []
+    iface = ""
+    skip = False
+    is_go = False
+    for ln in (iw_text or "").splitlines():
+        parts = ln.split()
+        if len(parts) >= 2 and parts[0] == "Interface":
+            if iface and is_go and not skip:
+                gos.append(iface)
+            iface = parts[1]
+            skip = iface.startswith("p2p-dev-")
+            is_go = False
+            continue
+        if skip or not iface:
+            continue
+        if len(parts) >= 2 and parts[0] == "type" and parts[1] == "P2P-GO":
+            is_go = True
+    if iface and is_go and not skip:
+        gos.append(iface)
+    return gos
+
+
+def netdev_is_usb(iface: str, *, device_path: str = "", parent: str = "") -> bool:
+    """True for udev USB wifi names or a sysfs device path under /usb."""
+    if _is_usb_iface(iface) or _is_usb_iface(parent):
+        return True
+    return "/usb" in (device_path or "").lower()
+
+
+def keep_bss_go_iface(
+    go_ifaces: list[str],
+    usb_ifaces: set[str],
+    *,
+    parent_of: Optional[Any] = None,
+) -> str:
+    """USB dedicated GO to keep across reconnect; empty for STA-shared leftover.
+
+    AX201 leftover ``p2p-wlp0s20-0`` must not take keep-BSS: FluxCast then
+    ``p2p_connect``s the live group and times out.
+    """
+    for go in go_ifaces:
+        if not go:
+            continue
+        if go in usb_ifaces or netdev_is_usb(go):
+            return go
+        parent = ""
+        if callable(parent_of):
+            parent = str(parent_of(go) or "")
+        if parent and (parent in usb_ifaces or netdev_is_usb(parent)):
+            return go
+    return ""
+
+
+def _device_realpath(iface: str) -> str:
+    try:
+        return str((Path("/sys/class/net") / iface / "device").resolve())
+    except OSError:
+        return ""
+
+
+def _parent_managed(iface: str) -> str:
+    link = Path(f"/sys/class/net/{iface}/phy80211")
+    try:
+        phy = os.path.basename(os.readlink(link))
+    except OSError:
+        return ""
+    for n in _ifaces_on_phy(phy):
+        if not n.startswith("p2p-"):
+            return n
+    return ""
+
+
+def live_usb_netdevs() -> set[str]:
+    found: set[str] = set()
+    net = Path("/sys/class/net")
+    if not net.is_dir():
+        return found
+    for p in net.iterdir():
+        parent = _parent_managed(p.name)
+        if netdev_is_usb(
+            p.name, device_path=_device_realpath(p.name), parent=parent
+        ):
+            found.add(p.name)
+    return found
+
+
+def live_keep_bss_go() -> str:
+    try:
+        text = _run(["iw", "dev"]).stdout or ""
+    except Exception:
+        text = ""
+    return keep_bss_go_iface(
+        parse_p2p_go_ifaces(text),
+        live_usb_netdevs(),
+        parent_of=_parent_managed,
+    )
+
+
+def _auto_pick(radios: list[dict[str, Any]]) -> Optional[str]:
+    if not radios:
+        return None
+    go = [r for r in radios if r.get("p2pGo")]
+    pool = go if go else radios
+    idle = [r for r in pool if not r.get("inUse")]
+    pool = idle if idle else pool
+    return sorted(pool, key=score_radio, reverse=True)[0]["iface"]
+
+
 def score_radio(r: dict[str, Any]) -> tuple:
     """Higher is better for auto-pick.
 
@@ -268,37 +384,40 @@ def score_radio(r: dict[str, Any]) -> tuple:
 
 
 def resolve_iface(prefer: Optional[str] = None, radios: Optional[list[dict[str, Any]]] = None) -> Optional[str]:
-    """Return preferred iface, or best auto pick, or None."""
+    """Return a *live* iface: explicit prefer if present, else auto-pick.
+
+    USB wifi names change on re-plug (…u4 → …u3). A missing prefer must not
+    be returned — dedicated wpa then fails to exec. If the stale name looked
+    like USB, pick a live USB P2P radio; otherwise auto among live radios.
+    """
     radios = list(radios) if radios is not None else list_radios()
     prefer = (prefer or "").strip()
     if prefer and prefer.lower() not in ("auto", "default", ""):
-        for r in radios:
-            if r["iface"] == prefer:
-                return prefer
-        # Explicit preference missing — still return it so callers can surface error,
-        # but auto-fallback if empty radios.
-        if radios:
-            # Keep explicit even if currently missing (hotplug later); caller may warn.
+        present = {r["iface"] for r in radios}
+        if prefer in present:
             return prefer
-        return None
-    if not radios:
-        return None
-    # Auto: only consider P2P-GO when any exist; else fall back to any wifi.
-    go = [r for r in radios if r.get("p2pGo")]
-    pool = go if go else radios
-    # Prefer not in use within pool
-    idle = [r for r in pool if not r.get("inUse")]
-    pool = idle if idle else pool
-    pool_sorted = sorted(pool, key=score_radio, reverse=True)
-    return pool_sorted[0]["iface"]
+        if _is_usb_iface(prefer):
+            usb = [r for r in radios if _is_usb_iface(r.get("iface") or "")]
+            return _auto_pick(usb) or _auto_pick(radios)
+        return _auto_pick(radios)
+    return _auto_pick(radios)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--resolve", action="store_true", help="print only the resolved iface")
+    ap.add_argument(
+        "--keep-bss-go",
+        action="store_true",
+        help="print USB dedicated P2P-GO iface to keep on reconnect (empty if none)",
+    )
     ap.add_argument("--prefer", default="", help="settings preference (auto or iface)")
     ap.add_argument("--json", action="store_true", default=True)
     args = ap.parse_args()
+    if args.keep_bss_go:
+        go = live_keep_bss_go()
+        print(go or "")
+        return 0 if go else 0
     radios = list_radios()
     resolved = resolve_iface(args.prefer or "auto", radios)
     if args.resolve:

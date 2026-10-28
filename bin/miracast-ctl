@@ -5652,21 +5652,24 @@ cmd_stop() {
     fi
     rm -f "$PID_FILE"
   fi
-  if [[ "$keep_workspaces" != "1" ]]; then
-    # User stop: tear down USB dedicated group. Start's internal stop
-    # (keep_workspaces=1) leaves a live BSS so Extend can attach without
-    # re-running SoftMAC GO Neg (Confirm TX is racy).
-    disconnect_log "user stop: removing USB P2P group ifaces"
-    # Dedicated wpa/p2p-* are root-owned. sudo -n is a no-op without a ticket;
-    # leftover DIRECT-* then makes the next Extend unpark during askpass.
-    local _root _ask
-    _root="$(resolve_fluxcast_root 2>/dev/null || true)"
-    _ask="${_root:+$_root/meta/fluxcast-askpass}"
-    [[ -x "$_ask" ]] || _ask="/usr/libexec/fluxcast-askpass"
-    python3 - "$_ask" <<'PY'
+  # User stop: tear down every P2P group. Start's internal stop
+  # (keep_workspaces=1) keeps USB dedicated BSS (SoftMAC GO Neg is racy)
+  # and still deletes STA-shared leftover GO (AX201 p2p-wlp0s20-*).
+  disconnect_log "stop: removing P2P group ifaces keep_workspaces=$keep_workspaces"
+  local _root _ask
+  _root="$(resolve_fluxcast_root 2>/dev/null || true)"
+  _ask="${_root:+$_root/meta/fluxcast-askpass}"
+  [[ -x "$_ask" ]] || _ask="/usr/libexec/fluxcast-askpass"
+  PYTHONPATH="$PLUGIN_DIR/scripts${PYTHONPATH:+:$PYTHONPATH}" python3 - "$_ask" "$keep_workspaces" "$PLUGIN_DIR/scripts" <<'PY'
 import os, subprocess, sys
 from pathlib import Path
-ask = sys.argv[1]
+ask, keep, scripts = sys.argv[1], sys.argv[2] == "1", sys.argv[3]
+sys.path.insert(0, scripts)
+try:
+    from list_p2p_radios import live_usb_netdevs, netdev_is_usb
+except Exception:
+    live_usb_netdevs = lambda: set()
+    netdev_is_usb = lambda name, **k: False
 env = os.environ.copy()
 def run(argv):
     cmd = list(argv)
@@ -5678,18 +5681,23 @@ def run(argv):
             cmd = ["sudo", *argv]
     subprocess.run(cmd, timeout=120, check=False, env=env,
                    stdin=subprocess.DEVNULL, capture_output=True)
+usb = live_usb_netdevs()
 for p in Path("/sys/class/net").glob("p2p-*"):
+    if p.name.startswith("p2p-dev-"):
+        continue
+    if keep and (p.name in usb or netdev_is_usb(p.name)):
+        continue
     run(["iw", "dev", p.name, "del"])
-pidf = Path("/tmp/fluxcast-usb-wpa/wpa.pid")
-if pidf.exists():
-    try:
-        pid = int(pidf.read_text().strip())
-    except ValueError:
-        pid = 0
-    if pid:
-        run(["kill", str(pid)])
+if not keep:
+    pidf = Path("/tmp/fluxcast-usb-wpa/wpa.pid")
+    if pidf.exists():
+        try:
+            pid = int(pidf.read_text().strip())
+        except ValueError:
+            pid = 0
+        if pid:
+            run(["kill", str(pid)])
 PY
-  fi
   rm -f "$HEALTH_WATCH_PID_FILE"
   # Best-effort cleanup of FluxCast / capture leftovers without self-matching kill
   python3 - "$HEADLESS_FILE" <<'PY'
@@ -5863,25 +5871,13 @@ PY
 
   # Peer/mode reconnect: keep the Extend desktop when preserve is on.
   # Explicit UI Stop does not pass --keep-workspaces (windows return to eDP).
-  # If a USB GO BSS is already up, do not cmd_stop — that kills FluxCast
-  # (and often the BSS) while the sink is still associated, then p2p_find
-  # cannot see the TV.
+  # USB dedicated GO: keep the BSS (SoftMAC GO Neg is racy). AX201 leftover
+  # GO must not take this path — FluxCast p2p_connects and times out.
   local _usb_go=""
-  _usb_go="$(python3 - <<'PY' 2>/dev/null || true
-from pathlib import Path
-import subprocess
-for p in Path("/sys/class/net").glob("p2p-*"):
-    try:
-        r = subprocess.run(["iw", "dev", p.name, "info"], capture_output=True, text=True, timeout=3)
-    except Exception:
-        continue
-    if "type P2P-GO" in r.stdout:
-        print(p.name)
-        break
-PY
-)"
+  _usb_go="$(PYTHONPATH="$PLUGIN_DIR/scripts${PYTHONPATH:+:$PYTHONPATH}" python3 "$PLUGIN_DIR/scripts/list_p2p_radios.py" --keep-bss-go 2>/dev/null || true)"
+  _usb_go="${_usb_go//$'\n'/}"
   if [[ -n "$_usb_go" ]]; then
-    echo "[miracast-ctl] USB GO $_usb_go still up; restarting FluxCast only (keep BSS)" >>"$LOG_DIR/cast.log"
+    echo "[miracast-ctl] USB dedicated GO $_usb_go still up; restarting FluxCast only (keep BSS)" >>"$LOG_DIR/cast.log"
     stop_miracast_health_watcher || true
     if [[ -f "$PID_FILE" ]]; then
       local _old

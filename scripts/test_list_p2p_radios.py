@@ -6,7 +6,12 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from list_p2p_radios import _adapter_name, resolve_iface
+from list_p2p_radios import (
+    _adapter_name,
+    keep_bss_go_iface,
+    parse_p2p_go_ifaces,
+    resolve_iface,
+)
 
 
 class ResolveIfaceTest(unittest.TestCase):
@@ -33,6 +38,20 @@ class ResolveIfaceTest(unittest.TestCase):
         ]
         self.assertEqual(resolve_iface("wlp0s20f3", radios), "wlp0s20f3")
 
+    def test_stale_usb_prefer_picks_live_usb(self):
+        radios = [
+            {"iface": "wlp0s20f3", "p2pGo": True, "inUse": True},
+            {"iface": "wlp0s20f0u3", "p2pGo": True, "inUse": False},
+        ]
+        self.assertEqual(resolve_iface("wlp0s20f0u4", radios), "wlp0s20f0u3")
+
+    def test_stale_non_usb_prefer_auto_picks_idle_go(self):
+        radios = [
+            {"iface": "wlp0s20f3", "p2pGo": True, "inUse": True},
+            {"iface": "wlan1", "p2pGo": True, "inUse": False},
+        ]
+        self.assertEqual(resolve_iface("wlan0", radios), "wlan1")
+
     def test_fallback_to_busy_go(self):
         radios = [
             {"iface": "wlp0s20f3", "p2pGo": True, "inUse": True},
@@ -46,6 +65,49 @@ class ResolveIfaceTest(unittest.TestCase):
             {"iface": "wlan1", "p2pGo": False, "inUse": False},
         ]
         self.assertEqual(resolve_iface("auto", radios), "wlan1")
+
+
+class KeepBssGoTest(unittest.TestCase):
+    def test_parse_ax201_go(self):
+        iw = (
+            "phy#0\n"
+            "\tInterface p2p-wlp0s20-0\n"
+            "\t\ttype P2P-GO\n"
+            "\t\tssid DIRECT-dN\n"
+            "\tInterface wlp0s20f3\n"
+            "\t\ttype managed\n"
+        )
+        self.assertEqual(parse_p2p_go_ifaces(iw), ["p2p-wlp0s20-0"])
+
+    def test_ax201_leftover_does_not_keep_bss(self):
+        self.assertEqual(
+            keep_bss_go_iface(["p2p-wlp0s20-0"], set(), parent_of=lambda _: "wlp0s20f3"),
+            "",
+        )
+
+    def test_usb_named_go_keeps_bss(self):
+        self.assertEqual(
+            keep_bss_go_iface(
+                ["p2p-wlp0s20f0u4-0"],
+                {"wlp0s20f0u4", "p2p-wlp0s20f0u4-0"},
+                parent_of=lambda _: "wlp0s20f0u4",
+            ),
+            "p2p-wlp0s20f0u4-0",
+        )
+
+    def test_dedicated_p2p0_on_usb_phy_keeps_bss(self):
+        self.assertEqual(
+            keep_bss_go_iface(
+                ["p2p-0"],
+                {"wlan1", "p2p-0"},
+                parent_of=lambda _: "wlan1",
+            ),
+            "p2p-0",
+        )
+
+    def test_skip_p2p_dev(self):
+        iw = "\tInterface p2p-dev-wlp0s20f3\n\t\ttype P2P-device\n"
+        self.assertEqual(parse_p2p_go_ifaces(iw), [])
 
 
 class AdapterNameTest(unittest.TestCase):
