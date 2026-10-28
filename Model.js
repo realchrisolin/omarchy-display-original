@@ -91,6 +91,26 @@ function brightnessName(percent) {
   return "Night owl"
 }
 
+function quoteLua(text) {
+  return '"' + String(text === undefined || text === null ? "" : text)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, " ") + '"'
+}
+
+function displayToggleSpec(name, enabled) {
+  if (!name) return ""
+  if (enabled) return "hl.monitor({ output = " + quoteLua(name) + ", disabled = true })"
+  return "hl.monitor({ output = " + quoteLua(name) + ", disabled = false, mode = \"preferred\", position = \"auto\", scale = \"auto\" })"
+}
+
+function displayToggleCommand(name, enabled, internalMonitor) {
+  if (!name) return null
+  if (internalMonitor && name === internalMonitor)
+    return ["omarchy-hyprland-monitor-internal", enabled ? "off" : "on"]
+  return ["hyprctl", "eval", displayToggleSpec(name, enabled)]
+}
+
 function parseDisplays(raw) {
   var displays = []
   try {
@@ -546,6 +566,9 @@ if (typeof module !== "undefined") {
     matchingScaleIndex: matchingScaleIndex,
     availableScales: availableScales,
     brightnessName: brightnessName,
+    quoteLua: quoteLua,
+    displayToggleSpec: displayToggleSpec,
+    displayToggleCommand: displayToggleCommand,
     parseDisplays: parseDisplays,
     inferExtendPosition: inferExtendPosition,
     miracastPhaseLabel: miracastPhaseLabel,

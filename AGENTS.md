@@ -31,15 +31,18 @@ Keep this file short. Depth lives in the docs below — link, don’t paste.
 - **Plugin id** is `realchrisolin.monitor` (not `colin.monitor` / not stock `omarchy.monitor`).
 - **Privacy in logs / commits / public benches:** scrub SSIDs and MACs; use the sanitize helpers when publishing benchmarks.
 
+## v2 Display (`v2-dev`)
+
+kris-1 monitor-layout is vendored on this branch (`Arrangement.qml`, `LayoutApplier.qml`,
+`LayoutModel.js`; SHA in `docs/UPSTREAM-monitor-layout.txt`). Contract: `docs/V2.md`.
+Bar entry is `DisplayPanel.qml` (layout host + `MiracastSection.qml`). Do not name the
+entry `Panel.qml` — that shadows `qs.Ui.Panel`. Virtual heads stay out of Arrangement
+apply/drag; unparked Miracast heads can appear as preview-only tiles.
+
 ## Dual UI surfaces
 
-Miracast UI is duplicated for bar + standalone display:
-
-- `Panel.qml`
-- `DisplayPanel.qml`
-- Shared logic: `MiracastService.qml`, `Model.js`
-
-Behavior/label/pill changes that touch Miracast controls must stay in sync across both QML entrypoints unless one path is intentionally different (say so in the commit). Example: Freq./Bandwidth were removed from the **Display** dropdown (`DisplayPanel.qml`) only; the bar `Panel.qml` still shows them.
+Bar widget entry is `DisplayPanel.qml`. Cast controls live in `MiracastSection.qml`.
+Shared logic: `MiracastService.qml`, `Model.js`, `LayoutModel.js`.
 
 ## Where state lives
 
@@ -55,9 +58,10 @@ Live knob changes while streaming: `miracast-ctl set-quality` / `set-quality-eff
 
 ## Tests
 
-Prefer targeted unit/CLI tests under `scripts/`:
+Prefer targeted unit/CLI tests under `scripts/` and `tests/`:
 
 ```bash
+node --test tests/*.test.cjs
 python3 -m unittest scripts.test_dynamic_encode scripts.test_encode_quality_presets
 bash scripts/test_miracast_ctl_encode_cli.sh
 ```

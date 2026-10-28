@@ -22,3 +22,4 @@ hyprland-plugins/**/*.so
 !hyprland-plugins/icc-present-kick/icc-present-kick.so
 hyprland-plugins/**/*.so.*
 !hyprland-plugins/icc-present-kick/icc-present-kick.so.DISABLED
+node_modules/

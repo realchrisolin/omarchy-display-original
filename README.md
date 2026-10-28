@@ -3,6 +3,10 @@
 Extends the Omarchy **Display** bar panel (brightness, text size, scale,
 per-output controls) with **Miracast / Wi‑Fi Display** mirror and extend.
 
+Branch **`v2-dev`** vendors [kris-1/omarchy-monitor-layout](https://github.com/kris-1/omarchy-monitor-layout)
+(drag-and-drop arrangement) and hosts Miracast in `MiracastSection.qml`. See
+[`docs/V2.md`](docs/V2.md). `master` still uses `DisplayPanel.qml` without that layout UI.
+
 This is still the Display dropdown — not a separate cast icon.
 
 Cloned from first-party `omarchy.monitor`, then extended.
@@ -180,8 +184,8 @@ Override in `~/.config/omarchy-miracast/settings.json` (merged with
 | `castPreset` | `desktop` | Content hint: `desktop` = damage-aware; `movie` = continuous `-D`. |
 | `vaapiQuality` | *(from profile)* | ffmpeg `h264_vaapi` `-quality` (1–8; higher = faster/worse). |
 | `vbvMultiplier` | `0.5` | CBR VBV as a fraction of bitrate (~0.5 s). → `FLUXCAST_WFD_VBV_MULTIPLIER`. |
-| `p2pWifiInterface` | `auto` | Managed Wi‑Fi iface for Miracast P2P, or `auto` (prefer **idle** P2P-GO NIC so Miracast is not time-sliced with home STA). |
-| `p2pGo5GHz` | `false` | USB GO only: keep 5 GHz in the GO channel set. Default drops 5 GHz (`p2p_no_go_freq`). Ignored on NetworkManager ifaces. |
+| `p2pWifiInterface` | `auto` | Managed Wi‑Fi iface for Miracast P2P, or `auto` (prefer **idle** P2P-GO NIC so Miracast is not time-sliced with home STA). USB names change on re-plug; a missing saved iface is resolved to a live radio of the same role, not kept as a stale name. |
+| `p2pGo5GHz` | `false` | USB GO only: keep 5 GHz in the GO channel set. Default drops 5 GHz (`p2p_no_go_freq`). After PLAY, FluxCast may 802.11-CSA to 2.4 if the phy cannot carry 5 GHz WFD; a sink that does not follow is remembered (`p2p-csa-nofollow`) and the hop is skipped next time. Ignored on NetworkManager ifaces. |
 | `usbWpaSupplicant` | *(empty)* | Absolute path to `wpa_supplicant` for dedicated USB P2P. Empty = `PATH`. Also `FLUXCAST_USB_WPA`. |
 | `p2pQuietCsa` | `false` | `true` = post-PLAY CSA to a quiet channel (MCC). Default **SCC**. |
 | `vaapiRcMode` | *(from profile)* | `CQP` / `QVBR` / `CBR` / `VBR` → `FLUXCAST_WFD_VAAPI_RC`. |
@@ -345,7 +349,8 @@ channel.
 **While streaming**, `scripts/miracast_link_watch.py` (started after PLAY) watches
 the link cheaply: sysfs TX bytes every ~8s, `iw station dump` every few ticks,
 and a **cached** `nmcli wifi list` score at most every ~3 minutes and only after
-sustained high retries / IDR bursts. Stall (TX &lt; ~3 Mbps for ~24s — often a
+sustained high retries / IDR bursts (sink `wfd_idr_request` ≥2/tick is
+decoder stall → QVBR drop, not iw-retry LOSS). Stall (TX &lt; ~3 Mbps for ~24s — often a
 wedged VAAPI pipe) → `restart-capture`. A clearly better 2.4 GHz score can CSA
 (5 min cooldown, max 2/hour, score margin). No forced Wi‑Fi rescans on the hot
 path.
@@ -354,8 +359,44 @@ path.
 
 Miracast **must not** call `hyprctl output remove` / `monitor,disable` during
 connect or disconnect — those calls have frozen the primary display for
-30–90s. Stop leaves the virtual output in place; the next Extend session
-**reuses** it. Orphan cleanup is never automatic on the hot path.
+30–90s. Stop leaves the virtual output in place (`persistent-miracast`, often
+parked at `-12000x0`); the next Extend session **reuses** it. Orphan cleanup
+is never automatic on the hot path. Heads clear on Hyprland restart.
+
+**Disconnected session cleanup.** When nothing is casting and no P2P group is
+up, `miracast-ctl status` reconciles: stale `error`/connecting → `idle`, reap
+watchers, drop parked-tracking files if the head is already gone, and re-park
+an on-layout idle Extend head off-layout. It does **not** destroy the head.
+Idle polls also skip `wpa_cli p2p_peer` for `lastPeerMac` so a dead sink does
+not keep privileged Wi‑Fi probes forever.
+
+**Hardware cursor plane.** Keep `cursor:no_hardware_cursors=true` while any
+virtual head exists (live or parked). Restoring the HW cursor plane in the
+same window as an eDP modeset has hard-locked i915 (no VT, caps-lock LED
+stuck). `miracast-ctl` already holds software cursors for that lifetime; do
+not toggle the option by hand to “fix” a missing pointer.
+
+**Inactive VT / DRM master.** Hyprland on TTY1 does not own DRM while another
+VT is active. `hyprctl dispatch` / `eval` that touches cursor, renderer, or
+outputs (`force_renderer_reload`, `omarchy restart shell`, focus/warp onto
+eDP, `no_hardware_cursors` changes) queues KMS work that applies when the
+session regains master. Switching back (`Ctrl+Alt+F1`) has hard-locked i915
+the same way — CPU may keep running; display and input die; there is often
+no `GPU hang` printk. On kenya, short power is ignored
+(`HandlePowerKey=ignore`); hold the power key.
+
+**Lost laptop pointer** with a parked head is usually the cursor on that
+head (check `hyprctl -j cursorpos` / focused monitor), not a hung eDP panel.
+`warp_on_change_workspace=1` focusing `ext-*` is enough to put it there.
+
+**Recovery**
+
+| Situation | Do | Do not |
+|-----------|----|--------|
+| Still on the graphical session, pointer on the parked head | `hyprctl` focus/cursor warp onto eDP only | `output remove`, `monitor,disable`, `force_renderer_reload`, bounce `no_hardware_cursors`, `omarchy restart shell` |
+| Already on another VT (TTY2, …) | Leave Hyprland alone. Reboot if you need the laptop. | Any of the above, then `Ctrl+Alt+F1` back |
+
+Read-only `hyprctl monitors` / `cursorpos` / `layers` is fine from any VT.
 
 ## Cast modes
 

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "realchrisolin.monitor",
   "name": "Display",
-  "version": "1.2.11",
+  "version": "2.0.0-dev",
   "author": "realchrisolin",
   "license": "MIT",
-  "description": "Brightness, text size, scale, displays, and Miracast / Wi\u2011Fi Display mirroring.",
+  "description": "Brightness, text size, drag-and-drop monitor layout, and Miracast / Wi-Fi Display.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,9 +14,10 @@
   },
   "barWidget": {
     "displayName": "Display",
-    "description": "Brightness, text size, scale, displays, and Miracast mirroring.",
+    "description": "Brightness, text size, scale, layout, displays, and Miracast mirroring.",
     "category": "System",
-    "allowMultiple": false
+    "allowMultiple": false,
+    "defaultSection": "right"
   },
   "omarchy": {
     "clonedFrom": "omarchy.monitor"
