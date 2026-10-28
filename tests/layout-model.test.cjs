@@ -32,6 +32,37 @@ test("logicalSize applies scale and rotation", () => {
   assert.deepEqual(Model.logicalSize(portrait), { w: 1080, h: 1920 })
 })
 
+test("computePositions packs from saved scale, not stale live scale", () => {
+  const edp = { ...laptop, name: "eDP-1", description: "Chimei", width: 1920, height: 1080, scale: 1, transform: 0, x: 0 }
+  const usb = { ...portrait, name: "DP-2", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920 }
+  const settings = {
+    [Model.monitorKey(edp)]: { scale: 1 },
+    [Model.monitorKey(usb)]: { scale: 1.5 }
+  }
+  const positions = Model.computePositions([edp, usb], [Model.monitorKey(edp), Model.monitorKey(usb)], {}, settings)
+  const byName = Object.fromEntries(positions.map(p => [p.name, p]))
+  assert.equal(byName["eDP-1"].x, 0)
+  assert.equal(byName["DP-2"].x, 1920)
+  const both = Model.computePositions([edp, usb], [Model.monitorKey(edp), Model.monitorKey(usb)], {}, {
+    [Model.monitorKey(edp)]: { scale: 1.5 },
+    [Model.monitorKey(usb)]: { scale: 1.5 }
+  })
+  assert.equal(Object.fromEntries(both.map(p => [p.name, p]))["DP-2"].x, 1280)
+})
+
+test("physicalReloadLua position matches JSON scale", () => {
+  const edp = { name: "eDP-1", description: "Chimei Innolux Corporation 0x14E7", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, disabled: false, mirrorOf: "none" }
+  const usb = { name: "DP-2", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 2, x: 1920, disabled: false, mirrorOf: "none" }
+  const lua = Model.physicalReloadLua([edp, usb], {
+    order: [Model.monitorKey(edp), Model.monitorKey(usb)],
+    monitors: {
+      [Model.monitorKey(edp)]: { scale: 1, transform: 0 },
+      [Model.monitorKey(usb)]: { scale: 1.5, transform: 2 }
+    }
+  })
+  assert.match(lua, /output = "DP-2".*position = "1920x0".*scale = 1\.5/)
+})
+
 test("disabled and mirrored monitors are not arranged", () => {
   assert.equal(Model.isArrangeable({ ...ultrawide, disabled: true }), false)
   assert.equal(Model.isArrangeable({ ...ultrawide, mirrorOf: "eDP-1" }), false)

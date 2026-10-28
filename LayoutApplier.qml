@@ -85,7 +85,7 @@ QtObject {
 
         root._persistReloadLua(monitors, layout)
 
-        var positions = LayoutModel.computePositions(monitors, layout.order, layout.stack)
+        var positions = LayoutModel.computePositions(monitors, layout.order, layout.stack, layout.monitors)
         // Only unplugged outputs are parked; a connected but disabled one (the
         // laptop screen in external-only mode) is left alone.
         var connected = monitors.map(function(monitor) { return String(monitor.name) })
@@ -101,7 +101,7 @@ QtObject {
           root._finish()
           return
         }
-        var staging = LayoutModel.stagingX(monitors, positions)
+        var staging = LayoutModel.stagingX(monitors, positions, layout.monitors)
         root.evalProc.command = ["hyprctl", "eval", LayoutModel.positionsToLua(positions, staging, parked)]
         root.evalProc.running = true
       }

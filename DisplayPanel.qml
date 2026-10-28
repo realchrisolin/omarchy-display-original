@@ -380,8 +380,6 @@ Panel {
   function setScale(scale) {
     var cleaned = root.effectiveScale(scale)
     arrangement.rememberSettings(root.focusedMonitor, { scale: Number(cleaned) })
-    actionProc.command = ["bash", "-c", "omarchy-hyprland-monitor-scaling " + scale]
-    if (!actionProc.running) actionProc.running = true
   }
 
   // Names no command: actionProc is shared, and either caller above may already

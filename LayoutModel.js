@@ -103,6 +103,20 @@ function logicalSize(monitor) {
   return { w: Math.round(width / scale), h: Math.round(height / scale) }
 }
 
+// Copy of `monitor` with JSON scale/transform when those fields are saved, so
+// packing uses intended logical size even if hyprctl still has the old scale.
+function withSavedGeometry(monitor, shared, monitorSettings) {
+  var saved = (monitorSettings || {})[monitorKey(monitor, shared)]
+    || (monitorSettings || {})[String(monitor.name || "")]
+    || {}
+  if (saved.scale === undefined && saved.transform === undefined) return monitor
+  var copy = {}
+  for (var k in monitor) copy[k] = monitor[k]
+  if (saved.scale !== undefined) copy.scale = saved.scale
+  if (saved.transform !== undefined) copy.transform = saved.transform
+  return copy
+}
+
 // Short tile label: "Built-in" for the laptop panel, otherwise the model
 // ("U34V5C", "DELL P2419H"), falling back to the description's first words
 // and then to the output name.
@@ -512,7 +526,8 @@ function physicalReloadLua(monitors, layout) {
   var positions = computePositions(
     monitors,
     (layout && layout.order) || [],
-    (layout && layout.stack) || {}
+    (layout && layout.stack) || {},
+    (layout && layout.monitors) || {}
   )
   var byName = {}
   for (var p = 0; p < positions.length; p++) byName[positions[p].name] = positions[p]
@@ -629,12 +644,14 @@ function activeStack(monitors, stack) {
 // [{ name, x, y, changed }] for every arrangeable monitor. Row monitors go
 // left to right, top-aligned; stacked ones are centered above or below the
 // monitor they stand on. Everything is shifted so the layout starts at 0x0.
-function computePositions(monitors, order, stack) {
+function computePositions(monitors, order, stack, monitorSettings) {
   var active = activeStack(monitors, stack)
   var list = (monitors || []).filter(isArrangeable)
   var shared = sharedDescriptions(list)
   var byKey = {}
-  list.forEach(function(monitor) { byKey[monitorKey(monitor, shared)] = monitor })
+  list.forEach(function(monitor) {
+    byKey[monitorKey(monitor, shared)] = withSavedGeometry(monitor, shared, monitorSettings)
+  })
 
   var placed = {}
   var row = sortMonitors(monitors, order).filter(function(monitor) {
@@ -642,8 +659,9 @@ function computePositions(monitors, order, stack) {
   })
   var x = 0
   row.forEach(function(monitor) {
-    var size = logicalSize(monitor)
-    placed[monitorKey(monitor, shared)] = { monitor: monitor, x: x, y: 0, w: size.w, h: size.h }
+    var geom = withSavedGeometry(monitor, shared, monitorSettings)
+    var size = logicalSize(geom)
+    placed[monitorKey(monitor, shared)] = { monitor: geom, x: x, y: 0, w: size.w, h: size.h }
     x += size.w
   })
 
@@ -812,13 +830,17 @@ function luaString(value) {
 
 // First free x to the right of every monitor, both where they are now and
 // where they are going. Staging monitors there keeps the move overlap-free.
-function stagingX(monitors, positions) {
+function stagingX(monitors, positions, monitorSettings) {
   var right = 0
   var list = (monitors || []).filter(isArrangeable)
-  for (var i = 0; i < list.length; i++)
-    right = Math.max(right, (Number(list[i].x) || 0) + logicalSize(list[i]).w)
+  var shared = sharedDescriptions(list)
+  for (var i = 0; i < list.length; i++) {
+    var geom = withSavedGeometry(list[i], shared, monitorSettings)
+    right = Math.max(right, (Number(list[i].x) || 0) + logicalSize(geom).w)
+  }
   var total = 0
-  for (var j = 0; j < list.length; j++) total += logicalSize(list[j]).w
+  for (var j = 0; j < list.length; j++)
+    total += logicalSize(withSavedGeometry(list[j], shared, monitorSettings)).w
   return Math.max(right, total)
 }
 
@@ -951,6 +973,7 @@ if (typeof module !== "undefined") {
     isPresenting: isPresenting,
     isArrangeable: isArrangeable,
     logicalSize: logicalSize,
+    withSavedGeometry: withSavedGeometry,
     tileLabel: tileLabel,
     cleanSettings: cleanSettings,
     parseLayout: parseLayout,
