@@ -63,6 +63,26 @@ test("physicalReloadLua position matches JSON scale", () => {
   assert.match(lua, /output = "DP-2".*position = "1920x0".*scale = 1\.5/)
 })
 
+test("physicalReloadLua follows JSON order (USB-C left of eDP)", () => {
+  const edp = { name: "eDP-1", description: "Chimei Innolux Corporation 0x14E7", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, disabled: false, mirrorOf: "none" }
+  const usb = { name: "DP-2", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 2, x: 1920, disabled: false, mirrorOf: "none" }
+  const lua = Model.physicalReloadLua([edp, usb], {
+    order: [Model.monitorKey(usb), Model.monitorKey(edp)],
+    monitors: {
+      [Model.monitorKey(edp)]: { scale: 1, transform: 0 },
+      [Model.monitorKey(usb)]: { scale: 1, transform: 2 }
+    }
+  })
+  assert.match(lua, /output = "DP-2".*position = "0x0"/)
+  assert.match(lua, /output = "eDP-1".*position = "1920x0"/)
+})
+
+test("tilesFromMonitors uses saved scale for tile size", () => {
+  const usb = { name: "DP-2", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, disabled: false, mirrorOf: "none" }
+  const tiles = Model.tilesFromMonitors([usb], {}, { [Model.monitorKey(usb)]: { scale: 1.5 } })
+  assert.equal(tiles[0].w, 1280)
+})
+
 test("disabled and mirrored monitors are not arranged", () => {
   assert.equal(Model.isArrangeable({ ...ultrawide, disabled: true }), false)
   assert.equal(Model.isArrangeable({ ...ultrawide, mirrorOf: "eDP-1" }), false)

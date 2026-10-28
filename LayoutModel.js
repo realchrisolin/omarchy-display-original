@@ -909,7 +909,7 @@ function dropIndex(tiles, from, offset) {
 // View model for the panel: arrangeable monitors sorted by current position,
 // left to right then top to bottom. `stacked` marks the ones standing on
 // another monitor (see activeStack).
-function tilesFromMonitors(monitors, stack) {
+function tilesFromMonitors(monitors, stack, monitorSettings) {
   var active = activeStack(monitors, stack)
   var previewable = (monitors || []).filter(isPreviewable)
   var shared = sharedDescriptions(previewable.filter(isArrangeable))
@@ -919,7 +919,8 @@ function tilesFromMonitors(monitors, stack) {
     labelCount[label] = (labelCount[label] || 0) + 1
   })
   var list = previewable.map(function(monitor) {
-    var size = logicalSize(monitor)
+    var geom = isVirtualHead(monitor) ? monitor : withSavedGeometry(monitor, shared, monitorSettings)
+    var size = logicalSize(geom)
     var label = tileLabel(monitor)
     var virtual = isVirtualHead(monitor)
     var key = virtual ? String(monitor.name) : monitorKey(monitor, shared)

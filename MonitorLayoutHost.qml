@@ -20,7 +20,7 @@ Item {
   height: 0
   implicitWidth: 0
   implicitHeight: 0
-  visible: false
+  // visible must stay true so Hyprland Connections and FileView still run.
   clip: true
 
   property var shell: null

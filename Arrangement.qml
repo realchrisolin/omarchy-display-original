@@ -248,7 +248,7 @@ Column {
         var monitors = []
         try { monitors = JSON.parse(String(text || "[]")) } catch (e) { monitors = [] }
         root.monitors = monitors
-        root.tiles = LayoutModel.tilesFromMonitors(monitors, orderFile.layout.stack)
+        root.tiles = LayoutModel.tilesFromMonitors(monitors, orderFile.layout.stack, orderFile.layout.monitors)
       }
     }
   }
