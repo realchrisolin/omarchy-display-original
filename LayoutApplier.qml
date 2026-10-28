@@ -33,6 +33,7 @@ QtObject {
   property var _layout: ({})
   property var _monitors: []
   property string _pendingLua: ""
+  property string _pendingJson: ""
 
   // positionsOnly: leave monitor settings alone, e.g. while a change made in
   // the properties window waits to be kept or reverted.
@@ -86,6 +87,7 @@ QtObject {
           return
         }
 
+        layout = LayoutModel.migrateLayoutOrder(layout, monitors)
         root._layout = layout
         root._monitors = monitors
         var positions = LayoutModel.computePositions(monitors, layout.order, layout.stack, layout.monitors)
@@ -99,7 +101,9 @@ QtObject {
         positions.forEach(function(p) { known.push(p.name) })
         root._knownOutputs = known
 
-        var anyChanged = positions.some(function(p) { return p.changed })
+        var anyChanged = positions.some(function(p) {
+          return p.changed && !LayoutModel.isVirtualHead({ name: p.name })
+        })
         if (!anyChanged) {
           root._persistReloadLua(monitors, layout)
           root._finish()
@@ -119,30 +123,37 @@ QtObject {
   }
 
   function _persistReloadLua(monitors, layout) {
+    root._pendingJson = LayoutModel.serializeLayout(layout)
     root._pendingLua = LayoutModel.physicalReloadLua(monitors, layout)
     root._flushLua()
   }
 
   function _flushLua() {
     if (luaPersist.running) return
+    var json = root._pendingJson
     var lua = root._pendingLua
-    if (!lua) return
+    if (!json && !lua) return
+    root._pendingJson = ""
     root._pendingLua = ""
     luaPersist.command = ["python3", "-c",
       "import base64, fcntl, sys\n"
       + "from pathlib import Path\n"
-      + "p = Path(sys.argv[1])\n"
-      + "t = base64.b64decode(sys.argv[2]).decode()\n"
-      + "p.parent.mkdir(parents=True, exist_ok=True)\n"
-      + "lock = open(str(p) + '.lock', 'a')\n"
-      + "fcntl.flock(lock, fcntl.LOCK_EX)\n"
-      + "try:\n"
-      + "    if not p.exists() or p.read_text() != t:\n"
-      + "        p.write_text(t)\n"
-      + "finally:\n"
-      + "    fcntl.flock(lock, fcntl.LOCK_UN)\n"
-      + "    lock.close()\n",
-      root.reloadLuaPath, Qt.btoa(lua)]
+      + "def write(path, raw):\n"
+      + "    if not raw: return\n"
+      + "    p = Path(path)\n"
+      + "    t = base64.b64decode(raw).decode()\n"
+      + "    p.parent.mkdir(parents=True, exist_ok=True)\n"
+      + "    lock = open(str(p) + '.lock', 'a')\n"
+      + "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
+      + "    try:\n"
+      + "        if not p.exists() or p.read_text() != t:\n"
+      + "            p.write_text(t)\n"
+      + "    finally:\n"
+      + "        fcntl.flock(lock, fcntl.LOCK_UN)\n"
+      + "        lock.close()\n"
+      + "write(sys.argv[1], sys.argv[3])\n"
+      + "write(sys.argv[2], sys.argv[4])\n",
+      root.orderPath, root.reloadLuaPath, Qt.btoa(json), Qt.btoa(lua)]
     luaPersist.running = true
   }
 

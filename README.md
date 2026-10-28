@@ -165,16 +165,15 @@ Override in `~/.config/omarchy-miracast/settings.json` (merged with
 | `fps` | `20` | Fallback when `streamMode` is unset |
 | `outputRes` | `1280x720` | Encoded size (fallback) |
 | `extendResolution` | `1280x720` | Extend virtual output size (fallback) |
-| `extendRefresh` | `30` | Preferred virtual output Hz (keep aligned with stream) |
-| `bitrate` | `8M` | Current encode target (QVBR/CBR). Under `encodeStrategy=smartview` ABR uses Samsung dig **2–14 Mbps** (init **8M**). |
+| `extendRefresh` | stream fps (clamped to advertised HEADLESS modes, typically **60**) | Virtual output Hz. Hyprland HEADLESS often lists only 60 Hz — do not invent 30 Hz (ICC stalls, ffmpeg IO watchdog rebinds). `scripts/headless_refresh.py` picks the live RTSP fps when advertised. |
+| `bitrate` | `8M` | Current encode target. Under `encodeStrategy=smartview` ABR uses Samsung dig **2–14 Mbps** (init **8M**). Interactive kenya/hotyeah profile uses **CBR** (AOSP `OMX_Video_ControlRateConstant`); QVBR on Intel undershoots (~0.2 Mbps) and turns a 0.25 s VBV into seconds of lag. |
 | `videoEncoder` | `auto` | `auto` → VAAPI, else NVENC, else QSV, else `libx264` |
 | *(env)* `FLUXCAST_WFD_CAPTURE_ENCODE` | `auto` (Omarchy) / `pipe` (upstream) | `auto`/`vaapi` = wf-recorder DMA-BUF encode (incl. scaled outputs); `pipe` = raw→ffmpeg hwupload |
 | *(env)* `FLUXCAST_WFD_DMABUF_ALLOW_SCALED` | allow (default) | `0`/`false` = force pipe when Hyprland scale ≠ 1 |
-| `encodeStrategy` | `smartview` | `smartview` = QVBR + BitrateController (Samsung 2/8/14M, qmin/qmax 15–44, minrate floor; DMA-BUF via `prepare_dmabuf_settings`); `performance` = DMA-BUF CQP |
+| `encodeStrategy` | `smartview` | `smartview` = DMA-BUF + BitrateController (Samsung 2/8/14M, qmin/qmax 15–44). **CBR** is the interactive RC (AOSP Converter.cpp); QVBR remains available if `vaapiRcMode` is set. `performance` = DMA-BUF CQP. |
 | `captureEncode` | `dmabuf` | RENDER ENGINE: `dmabuf` (GPU + DMA-BUF) / `vaapi` (GPU pipe) / `cpu` |
-| `audioEnabled` | `true` | Creates a PipeWire/Pulse **Miracast** null sink for capture. FluxCast captures **`miracast.monitor`**. LPCM-only TVs use WFD `stream_type=0x83`; keep the Miracast sink near **100%** or the TV sounds faded. See [BUILD.md §6](BUILD.md). |
+| `audioEnabled` | `true` | PipeWire/Pulse **Miracast** null sink; FluxCast captures **`miracast.monitor`**. If the sink lists LPCM, FluxCast muxes WFD **`stream_type=0x83`** (hotyeah / many Realtek dongles are LPCM-only — AAC is silent). AAC only when LPCM is absent or `FLUXCAST_WFD_FORCE_AAC=1`. Do **not** use ffmpeg `aresample=async` (held ~0.5 s). Keep the Miracast sink near **100%**. See [BUILD.md §6](BUILD.md). |
 | `autoSwitchAudioOutput` | `true` | Panel: **Automatically switch audio output**. On: default sink → Miracast at PLAY (speakers held during connect). Off: leave the currently selected output; still create the Miracast sink for manual routing / capture. |
-| `extendRefresh` | `30` | Hyprland refresh for the Extend virtual output. Keep matched to stream fps (30) so capture does not outrun encode. |
 | `softwareCursors` | `true` | Force SW cursors so the pointer appears on the TV (HW cursor plane is not captured). |
 | `wfRecorderBin` | unset | Absolute path to a custom `wf-recorder`. **Required for QVBR target hit** (build with `rc_min_rate` apply). Empty = PATH stock (undershoots QVBR to ~3 Mbps). ICC/PR #347 optional for capture pacing; see [BUILD.md §7](BUILD.md). |
 | `wfRecorderProto` | `auto` | `auto` / `icc` / `wlr`. `auto` upgrades to `icc` when a configured binary advertises ICC. Use `wlr` + stock binary if cast-head terminal keys feel buffered until the pointer moves. |
@@ -183,7 +182,7 @@ Override in `~/.config/omarchy-miracast/settings.json` (merged with
 | `encodeProfile` | `medium` | Quality: **best\|veryhigh\|high\|medium\|low** — knobs **per engine** (`scripts/encode_quality_presets.py`). |
 | `castPreset` | `desktop` | Content hint: `desktop` = damage-aware; `movie` = continuous `-D`. |
 | `vaapiQuality` | *(from profile)* | ffmpeg `h264_vaapi` `-quality` (1–8; higher = faster/worse). |
-| `vbvMultiplier` | `0.5` | CBR VBV as a fraction of bitrate (~0.5 s). → `FLUXCAST_WFD_VBV_MULTIPLIER`. |
+| `vbvMultiplier` | `0.25` (CBR) / `0.1` cap (QVBR) | CBR: Intel low-delay HRD **0.25 s** of target (smaller pumped quality on iHD). QVBR: cap seconds; FluxCast sizes `bufsize` from ~4 frames so undershoot cannot turn `peak×0.25` into many seconds. → `FLUXCAST_WFD_VBV_MULTIPLIER`. |
 | `p2pWifiInterface` | `auto` | Managed Wi‑Fi iface for Miracast P2P, or `auto` (prefer **idle** P2P-GO NIC so Miracast is not time-sliced with home STA). USB names change on re-plug; a missing saved iface is resolved to a live radio of the same role, not kept as a stale name. |
 | `p2pGo5GHz` | `false` | USB GO only: keep 5 GHz in the GO channel set. Default drops 5 GHz (`p2p_no_go_freq`). After PLAY, FluxCast may 802.11-CSA to 2.4 if the phy cannot carry 5 GHz WFD; a sink that does not follow is remembered (`p2p-csa-nofollow`) and the hop is skipped next time. Ignored on NetworkManager ifaces. |
 | `usbWpaSupplicant` | *(empty)* | Absolute path to `wpa_supplicant` for dedicated USB P2P. Empty = `PATH`. Also `FLUXCAST_USB_WPA`. |
@@ -191,7 +190,7 @@ Override in `~/.config/omarchy-miracast/settings.json` (merged with
 | `vaapiRcMode` | *(from profile)* | `CQP` / `QVBR` / `CBR` / `VBR` → `FLUXCAST_WFD_VAAPI_RC`. |
 | `vaapiBitrate` | *(from profile)* | QVBR/CBR peak (`FLUXCAST_WFD_VAAPI_BITRATE`). |
 | `vaapiQp` | *(from profile)* | Quantizer (lower = sharper). |
-| `vaapiGop` | *(from profile)* | GOP frames. |
+| `vaapiGop` | `15` at 1080p60 CBR | GOP frames. CBR interactive uses **15** (~0.25 s IDR at 60 fps). ABR `set-stream-mode` must not reset this to 60 (1 s IDR = 1 s lag). QVBR keeps ~1 s (`fps` frames). |
 | `vaapiAsyncDepth` | `2` | Pipe `async_depth` (from profile). |
 | `sinkScales` | `{}` | Per-sink Extend scale, keyed by MAC (overrides default) |
 | `defaultExtendScale` | `1` | Extend scale when a sink has no `sinkScales` entry — **1** is cheapest for Hyprland |
@@ -206,14 +205,13 @@ controls). To restore single-row accordion behavior:
 "onlyExpandFocusedDisplay": true
 ```
 
-While connected, the Miracast display row shows **CAST MODE** / **EXTEND
-POSITION** (← ↑ ↓ → when Extend) and **SCALE**. Under **MIRACAST** (below **CONTROLS**): collapsible **ADVANCED SETTINGS**
-(**STREAM MODE**, **RENDER ENGINE**, **PRESET QUALITY**, **RADIO**).
-Scan / Doctor / Info / Stop stay under **CONTROLS**. Only the focused
+While connected, **WITH A MIRACAST DISPLAY** (under **WITH AN EXTERNAL DISPLAY**)
+has Extend / Mirror. Place the Extend head on the **ARRANGEMENT** canvas (drag
+the wifi tile left or right of the laptop; **h**/**l** with that tile selected).
+Double-click the wifi tile for scale/rotation plus stream/encode/radio.
+The **MIRACAST** row is a single line (summary + Scan / Doctor / Info / Start-Stop).
+Only the focused
 display row expands nested brightness/scale/cast controls.
-
-With focus on the CAST MODE / EXTEND POSITION row and Extend active, vim
-**hjkl** set position: **h** ← left, **j** ↓ below, **k** ↑ above, **l** → right.
 
 ### RENDER ENGINE
 
@@ -238,11 +236,31 @@ knobs). Live knob changes while streaming usually apply via `restart-capture`
 (SIGUSR1). If a GPU path fails, FluxCast falls back toward CPU; the **active**
 pill follows the resolved path (`capturePath` / `encoder` in status).
 
+### Interactive encode (WFD)
+
+Aligned with [Wi-Fi Display](https://www.wi-fi.org/system/files/Miracast_Specification_v2.3.pdf)
+§4.10.3 (adapt bitrate to the P2P link), [MS-WFDPE](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wfdpe/9ac9b0a4-0a94-483d-a8bf-cd7bfea99be0)
+interactive latency, and AOSP `Converter.cpp` (**CBR**, ~1 s IDR in stock AOSP;
+we use **GOP 15** at 60 fps for ~0.25 s IDR).
+
+| Knob | Interactive profile (kenya / hotyeah) | Why |
+|------|----------------------------------------|-----|
+| RC | **CBR** (`h264_vaapi`) | AOSP CBR. Intel QVBR undershoots (~0.2 Mbps) so a 3.5 Mbit VBV becomes seconds of lag. |
+| HRD | **0.25 s** of target (`bufsize ≈ bitrate/4`) | Intel low-delay AVC. 0.1 s pumped quality on iHD. |
+| GOP | **15** at 1080p60 | Shorter than AOSP’s 1 s IDR; ABR must not reset GOP to 60. |
+| `i_qfactor` | **1.0** | IDR same quantizer as P (no “refresh” flash). |
+| AU delimiter | `aud=1` | Helps MPEG-TS access-unit framing. |
+| Mux | DMA encode + ffmpeg **copy**; **no `aresample=async`** | That filter held ~0.5 s. |
+| Audio | **LPCM `0x83`** if the sink lists LPCM; else AAC | WFD + AOSP LPCM PES. LPCM-only dongles ignore AAC. |
+| HEADLESS Hz | Match negotiated fps; clamp to advertised modes (**60** typical) | 30 Hz on a 60 Hz-only head stalls ICC. |
+
+Layout: packer includes the Miracast tile. `positionsToLua` stages physical outputs **past** the virtual head, then moves `persistent-miracast`, then lands eDP — otherwise Hyprland warns **monitor layout overlaps**. `place-virtual-head` on **x,y-only** does not SIGUSR1 capture (`wf-recorder -o` follows the output name). Do not `miracast-ctl stop`/`start` to tweak encode (that modesets the virtual head; on kenya it has corrupted eDP). Use `restart-capture` or a user-requested reconnect.
+
 ### PRESET QUALITY
 
 Independent of render engine: **Best (Dynamic)** / **Very High** / **High** /
 **Medium** / **Low**. Knobs are per engine in `scripts/encode_quality_presets.py`
-(DMA-BUF high ≠ GPU-pipe high). Under **MIRACAST → ADVANCED SETTINGS**.
+(DMA-BUF high ≠ GPU-pipe high). Open the wifi tile **properties** (double-click or **I**).
 
 ```bash
 miracast-ctl set-quality best|veryhigh|high|medium|low

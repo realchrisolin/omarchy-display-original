@@ -96,28 +96,37 @@ const virt = {
   x: -1920, y: 0, focused: false, disabled: false, mirrorOf: "none"
 }
 
-test("Miracast virtual heads are not arranged", () => {
+test("Miracast virtual heads pack in the row, not as hl.monitor targets", () => {
   assert.equal(Model.isVirtualHead(virt), true)
-  assert.equal(Model.isVirtualHead({ name: "HEADLESS-2" }), true)
-  assert.equal(Model.isVirtualHead({ name: "Miracast-LG" }), true)
-  assert.equal(Model.isVirtualHead({ name: "HDMI-A-1", miracast: true }), true)
-  assert.equal(Model.isVirtualHead(laptop), false)
   assert.equal(Model.isArrangeable(virt), false)
+  assert.equal(Model.isPackable(virt), true)
   const parked = { ...virt, x: -12000 }
-  assert.equal(Model.isArrangeable(parked), false)
   assert.equal(Model.isParkedVirtual(parked), true)
-  assert.equal(Model.isPreviewable(parked), false)
-  assert.equal(Model.isPreviewable(virt), true)
-  const positions = Model.computePositions([laptop, virt, ultrawide], [
-    Model.monitorKey(laptop), Model.monitorKey(ultrawide)
-  ])
-  assert.deepEqual(positions.map(p => p.name), ["eDP-1", "HDMI-A-1"])
-  const tiles = Model.tilesFromMonitors([laptop, virt, ultrawide])
-  assert.deepEqual(tiles.map(t => t.name), ["persistent-miracast", "eDP-1", "HDMI-A-1"])
-  assert.equal(tiles.find(t => t.virtual).label, "Miracast")
-  assert.equal(tiles.find(t => t.virtual).virtual, true)
-  const parkedTiles = Model.tilesFromMonitors([laptop, parked, ultrawide])
-  assert.deepEqual(parkedTiles.map(t => t.name), ["eDP-1", "HDMI-A-1"])
+  const order = [Model.monitorKey(laptop), Model.monitorKey(ultrawide), "persistent-miracast"]
+  const positions = Model.computePositions([laptop, virt, ultrawide], order)
+  assert.deepEqual(positions.map(p => p.name), ["eDP-1", "HDMI-A-1", "persistent-miracast"])
+  assert.equal(positions.find(p => p.name === "persistent-miracast").x, 1536 + 3440)
+  const tiles = Model.tilesFromMonitors([laptop, virt, ultrawide], {}, {}, order)
+  assert.equal(tiles.find(t => t.virtual).x, 1536 + 3440)
+  const lua = Model.physicalReloadLua([laptop, virt, ultrawide], { order, monitors: {} })
+  assert.equal(/output = "persistent-miracast"/.test(lua), false)
+})
+
+test("migrateLayoutOrder appends Miracast to the right of hardware", () => {
+  const edp = { name: "eDP-1", description: "Chimei Innolux Corporation 0x14E7", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, y: 0, disabled: false, mirrorOf: "none" }
+  const usb = { name: "DP-1", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 2, x: 0, y: 0, disabled: false, mirrorOf: "none" }
+  const layout = { order: [Model.monitorKey(usb), Model.monitorKey(edp)], monitors: {} }
+  const next = Model.migrateLayoutOrder(layout, [edp, usb, virt])
+  assert.deepEqual(next.order[next.order.length - 1], "persistent-miracast")
+  const serialized = JSON.parse(Model.serializeLayout(next))
+  assert.ok(serialized.order.includes("persistent-miracast"))
+  const keys = next.order.slice()
+  const stepped = Model.withRowPosition(next, "persistent-miracast", keys, keys.indexOf("persistent-miracast") - 1)
+  assert.equal(stepped.order.indexOf("persistent-miracast"), keys.indexOf("persistent-miracast") - 1)
+  const tiles = Model.tilesFromMonitors([edp, usb, virt], {}, {}, next.order)
+  const tv = tiles.find(t => t.virtual)
+  const laptopTile = tiles.find(t => t.name === "eDP-1")
+  assert.equal(tv.x, laptopTile.x + laptopTile.w)
 })
 
 test("kenya Hyprland disabled=true on a live eDP is still arranged", () => {
@@ -131,8 +140,8 @@ test("kenya Hyprland disabled=true on a live eDP is still arranged", () => {
   }
   assert.equal(Model.isPresenting(edp), true)
   assert.equal(Model.isArrangeable(edp), true)
-  const tiles = Model.tilesFromMonitors([edp, virt])
-  assert.deepEqual(tiles.map(t => t.name), ["persistent-miracast", "eDP-1"])
+  const tiles = Model.tilesFromMonitors([edp, virt], {}, {}, ["eDP-1", "persistent-miracast"])
+  assert.deepEqual(tiles.map(t => t.name), ["eDP-1", "persistent-miracast"])
 })
 
 test("tileLabel names the built-in panel and shows the model", () => {
@@ -232,6 +241,28 @@ test("positionsToLua stages monitors before moving them into place", () => {
     'hl.monitor({ output = "HDMI-A-1", position = "0x0" })',
     'hl.monitor({ output = "eDP-1", position = "3440x0" })'
   ])
+})
+
+test("swapping Miracast left of eDP never overlaps during staged eval", () => {
+  const overlaps = (rects) => rects.some((a, i) => rects.some((b, j) =>
+    i < j && a.x < b.x + b.w && b.x < a.x + a.w))
+  const edp = { name: "eDP-1", description: "Chimei", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, disabled: false, mirrorOf: "none" }
+  const tv = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, y: 0, miracast: true }
+  const order = ["persistent-miracast", "Chimei"]
+  const positions = Model.computePositions([edp, tv], order)
+  const staging = Model.stagingX([edp, tv], positions)
+  const state = {
+    "eDP-1": { x: 0, w: 1920 },
+    "persistent-miracast": { x: 1920, w: 1920 }
+  }
+  const lua = Model.positionsToLua(positions, staging)
+  assert.match(lua, /persistent-miracast/)
+  for (const line of lua.split("\n")) {
+    const m = line.match(/output = "([^"]+)", position = "(-?\d+)x/)
+    if (!m) continue
+    state[m[1]].x = Number(m[2])
+    assert.equal(overlaps(Object.values(state)), false, line + " -> " + JSON.stringify(state))
+  }
 })
 
 test("staged moves never overlap, whichever way the monitors swap", () => {

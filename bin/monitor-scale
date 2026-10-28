@@ -267,12 +267,22 @@ elif pos == "below":
 else:
     x, y = plw, max(0, (plh - hlh) // 2)
 try:
-    refresh = int(float(settings.get("extendRefresh") or settings.get("fps") or 30))
+    refresh = int(float(settings.get("extendRefresh") or settings.get("fps") or 60))
 except Exception:
-    refresh = 30
-if refresh < 60:
-    refresh = 30
-else:
+    refresh = 60
+# Headless backends typically advertise only 60Hz. Forcing 30Hz stalls ICC.
+advertised = []
+for item in (virtual.get("availableModes") or []):
+    text = item if isinstance(item, str) else str((item or {}).get("refreshRate") or "")
+    if "@" in text:
+        try:
+            advertised.append(float(text.split("@", 1)[1].replace("Hz", "").strip()))
+        except ValueError:
+            pass
+if advertised:
+    want = refresh
+    refresh = int(round(min(advertised, key=lambda hz: abs(hz - want))))
+elif refresh < 1:
     refresh = 60
 print(f"{hw}x{hh}@{refresh}|{x}x{y}|{vs:g}")
 PY

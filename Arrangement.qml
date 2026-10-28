@@ -35,6 +35,8 @@ Column {
   property bool cursorActive: false
   // Host KeyboardPanel; the properties window opens beside its card.
   property var panel: null
+  // MiracastService: drag the HEADLESS tile to set extendPosition.
+  property var miracast: null
 
   readonly property string orderPath: Quickshell.env("HOME") + "/.config/omarchy/monitor-layout.json"
 
@@ -54,7 +56,15 @@ Column {
   }
   // One display still gets the section, for its settings; reordering needs two.
   readonly property bool available: tiles.length > 0
-  readonly property bool reorderable: tiles.filter(function(tile) { return !tile.virtual }).length > 1
+  readonly property bool reorderable: {
+    var phys = 0
+    var virt = 0
+    for (var i = 0; i < tiles.length; i++) {
+      if (tiles[i].virtual) virt++
+      else phys++
+    }
+    return phys > 1 || (phys >= 1 && virt > 0)
+  }
 
   // Keyboard cursor over the tiles, and the tile picked up with Enter (-1 = none).
   property int selectedIndex: 0
@@ -69,6 +79,11 @@ Column {
   // Hover asks the host panel to move its keyboard focus here.
   signal focusRequested()
 
+  Connections {
+    target: root.miracast
+    function onExtendPositionChanged() { if (root.active) root.refresh() }
+  }
+
   function refresh() {
     if (!monitorsProc.running) monitorsProc.running = true
   }
@@ -78,7 +93,6 @@ Column {
     if (!reorderable) return
     if (grabbedIndex >= 0) {
       var tile = tiles[grabbedIndex]
-      if (tile.virtual) return
       var row = rowKeys()
       var at = row.indexOf(tile.key)
       // A stacked tile joins the row beside the monitor it stood on.
@@ -116,7 +130,7 @@ Column {
 
   // Keys of the row monitors, left to right.
   function rowKeys() {
-    return tiles.filter(function(tile) { return !tile.stacked && !tile.virtual })
+    return tiles.filter(function(tile) { return !tile.stacked })
       .sort(function(a, b) { return a.x - b.x })
       .map(function(tile) { return tile.key })
   }
@@ -137,7 +151,10 @@ Column {
       showProperties()
       return
     }
-    if (tiles[selectedIndex].virtual) return
+    if (tiles[selectedIndex].virtual) {
+      showProperties()
+      return
+    }
     grabbedKey = grabbedIndex >= 0 ? "" : tiles[selectedIndex].key
   }
 
@@ -161,7 +178,6 @@ Column {
   // I: open the properties of the tile under the cursor.
   function showProperties() {
     if (!available || grabbedIndex >= 0 || !tiles[selectedIndex]) return
-    if (tiles[selectedIndex].virtual) return
     propertiesOutput = tiles[selectedIndex].name
   }
 
@@ -198,8 +214,20 @@ Column {
 
   // Where a dragged tile was dropped (LayoutModel.dropTarget): persist and
   // apply it; the tiles follow once the live layout has moved.
-  function dropTile(from, target) {
-    if (!tiles[from] || tiles[from].virtual) return
+  function dropTile(from, target, dx) {
+    if (!tiles[from]) return
+    if (tiles[from].virtual) {
+      // Row only — pack_virtual_xy does not honor stack.
+      if (target.side === "row")
+        saveLayout(LayoutModel.withRowPosition(orderFile.layout, tiles[from].key, rowKeys(), target.index))
+      else {
+        var keys = rowKeys()
+        var onIdx = keys.indexOf(target.on)
+        var idx = onIdx < 0 ? keys.length : onIdx
+        saveLayout(LayoutModel.withRowPosition(orderFile.layout, tiles[from].key, keys, idx))
+      }
+      return
+    }
     var tile = tiles[from]
     if (!tile || !target) return
     if (target.on) {
@@ -248,7 +276,15 @@ Column {
         var monitors = []
         try { monitors = JSON.parse(String(text || "[]")) } catch (e) { monitors = [] }
         root.monitors = monitors
-        root.tiles = LayoutModel.tilesFromMonitors(monitors, orderFile.layout.stack, orderFile.layout.monitors)
+        var layout = LayoutModel.migrateLayoutOrder(orderFile.layout, monitors)
+        if (JSON.stringify(layout.order) !== JSON.stringify(orderFile.layout.order || []))
+          orderFile.saveLayout(layout)
+        root.tiles = LayoutModel.tilesFromMonitors(
+          monitors,
+          layout.stack,
+          layout.monitors,
+          layout.order
+        )
       }
     }
   }
@@ -293,6 +329,7 @@ Column {
     id: properties
     bar: root.bar
     hostPanel: root.panel
+    miracast: root.miracast
     open: root.active && root.propertiesTile !== null
     monitor: {
       var tile = root.propertiesTile
@@ -412,7 +449,7 @@ Column {
         dragX = 0
         dragY = 0
         if (from < 0 || (Math.abs(dx) < 2 && Math.abs(dy) < 2)) return
-        root.dropTile(from, target(from, dx, dy))
+        root.dropTile(from, target(from, dx, dy), dx)
       }
 
       Repeater {
@@ -445,7 +482,7 @@ Column {
             // the gesture and swallow the release.
             preventStealing: true
             hoverEnabled: true
-            cursorShape: modelData.virtual || !root.reorderable ? Qt.PointingHandCursor
+            cursorShape: !root.reorderable ? Qt.PointingHandCursor
               : pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
 
             property point pressAt: Qt.point(0, 0)
@@ -455,7 +492,7 @@ Column {
               root.focusRequested()
             }
             onPressed: function(mouse) {
-              if (modelData.virtual || !root.reorderable) return
+              if (!root.reorderable) return
               pressAt = mapToItem(canvas, mouse.x, mouse.y)
               root.grabbedKey = ""
               canvas.dragX = 0
@@ -476,7 +513,6 @@ Column {
             }
             onReleased: canvas.finishDrag()
             onDoubleClicked: {
-              if (screenTile.modelData.virtual) return
               root.propertiesOutput = screenTile.modelData.name
             }
             onCanceled: {
@@ -587,6 +623,49 @@ Column {
           bordered: true
           active: orderFile.layout.withExternal === modelData.value
           onClicked: root.setExternalMode(modelData.value)
+        }
+      }
+    }
+  }
+
+  Column {
+    visible: root.miracast && root.miracast.active
+    width: parent.width
+    spacing: Style.space(10)
+    topPadding: Style.space(4)
+
+    PanelSectionHeader {
+      text: "WITH A MIRACAST DISPLAY"
+      foreground: root.bar.foreground
+      fontFamily: root.bar.fontFamily
+    }
+
+    Grid {
+      id: miracastModeRow
+      width: parent.width
+      columns: 2
+      spacing: Style.spacing.xs
+
+      readonly property real cellWidth: (width - spacing * (columns - 1)) / columns
+
+      Repeater {
+        model: [
+          { value: "extend", label: "Extend" },
+          { value: "mirror", label: "Mirror" }
+        ]
+
+        Button {
+          required property var modelData
+          width: miracastModeRow.cellWidth
+          text: modelData.label
+          fontSize: Style.font.caption
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          horizontalPadding: Style.spacing.sm
+          verticalPadding: Style.spacing.controlPaddingY
+          bordered: true
+          active: root.miracast && root.miracast.mode === modelData.value
+          onClicked: if (root.miracast) root.miracast.setMode(modelData.value)
         }
       }
     }

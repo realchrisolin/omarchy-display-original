@@ -25,7 +25,7 @@ class EncodeStrategyTest(unittest.TestCase):
         self.assertEqual(s["bitrate"], "8M")
         self.assertEqual(s["vaapiBitrate"], "8M")
         self.assertEqual(s["encodeWfdBitrateMbps"], 8.0)
-        self.assertEqual(s["vbvMultiplier"], "2.0")
+        self.assertEqual(s["vbvMultiplier"], "0.1")
         self.assertEqual(s["vaapiIQfactor"], "1.0")
         self.assertTrue(es.uses_sv_abr(s))
 
@@ -83,7 +83,7 @@ class EncodeStrategyTest(unittest.TestCase):
         self.assertEqual(s["bitrate"], "8M")
         self.assertEqual(s["encodeWfdBitrateMbps"], 8.0)
         self.assertEqual(s["vaapiGop"], 60)
-        self.assertEqual(s["vbvMultiplier"], "2.0")
+        self.assertEqual(s["vbvMultiplier"], "0.1")
         self.assertEqual(s["vaapiIQfactor"], "1.0")
 
     def test_prepare_clears_cqp_high_iqfactor_when_pinned(self):
@@ -96,6 +96,29 @@ class EncodeStrategyTest(unittest.TestCase):
         es.prepare_dmabuf_settings(s)
         self.assertEqual(s["vaapiIQfactor"], "1.0")
         self.assertEqual(s["captureEncode"], "dmabuf")
+
+    def test_prepare_preserves_cbr(self):
+        s = {
+            "encodeStrategy": "smartview",
+            "encodeStrategyPinnedEngine": True,
+            "captureEncode": "dmabuf",
+            "vaapiRcMode": "CBR",
+        }
+        es.prepare_dmabuf_settings(s)
+        self.assertEqual(s["vaapiRcMode"], "CBR")
+        self.assertEqual(s["captureEncode"], "dmabuf")
+
+    def test_prepare_cbr_shortens_one_second_gop(self):
+        s = {
+            "encodeStrategy": "smartview",
+            "encodeStrategyPinnedEngine": False,
+            "vaapiRcMode": "CBR",
+            "vaapiGop": 60,
+            "streamMode": "1920x1080p60",
+        }
+        es.prepare_dmabuf_settings(s)
+        self.assertEqual(s["vaapiGop"], 15)
+        self.assertEqual(s["vbvMultiplier"], "0.25")
 
     def test_starve_detector_triggers_after_streak(self):
         streak = 0

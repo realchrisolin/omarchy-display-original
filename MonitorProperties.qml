@@ -28,6 +28,8 @@ PanelWindow {
   // Live `hyprctl monitors -j` entry of the display, and its saved settings.
   property var monitor: null
   property var savedSettings: ({})
+  property var miracast: null
+  property bool miracastAdvancedOpen: false
 
   // Seconds a tried change waits for Keep before it is reverted.
   readonly property int trialSeconds: 30
@@ -84,7 +86,13 @@ PanelWindow {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   readonly property bool internal: !!monitor && LayoutModel.isInternal(monitor)
-  readonly property var resolutions: monitor ? LayoutModel.resolutionOptions(monitor.availableModes || []) : []
+  readonly property bool virtualHead: !!monitor && LayoutModel.isVirtualHead(monitor)
+  readonly property var resolutions: {
+    var list = monitor ? LayoutModel.resolutionOptions(monitor.availableModes || []) : []
+    if (list.length === 0 && stagedWidth > 0)
+      return [{ value: stagedWidth + "x" + stagedHeight, label: stagedWidth + " × " + stagedHeight }]
+    return list
+  }
   readonly property var refreshRates: monitor
     ? LayoutModel.refreshOptions(monitor.availableModes || [], stagedWidth, stagedHeight)
     : []
@@ -118,6 +126,7 @@ PanelWindow {
     stagedTransform = Number(monitor.transform) || 0
     currentVrr = savedSettings && savedSettings.vrr === 2 ? 2 : (monitor.vrr ? 1 : 0)
     stagedVrr = currentVrr
+    miracastAdvancedOpen = false
   }
 
   function stage(settings) {
@@ -479,9 +488,19 @@ PanelWindow {
       onActivateRequested: root.activate()
       onCloseRequested: root.trying ? root.revert() : root.close()
 
+      Flickable {
+        id: scrollArea
+        anchors.fill: parent
+        clip: true
+        contentWidth: width
+        contentHeight: body.implicitHeight
+        boundsBehavior: Flickable.StopAtBounds
+        interactive: body.implicitHeight > height
+        flickableDirection: Flickable.VerticalFlick
+
       Column {
         id: body
-        width: parent.width
+        width: scrollArea.width
         spacing: Style.space(14)
 
         // ---------- Hero: display icon · name/summary ----------
@@ -492,7 +511,7 @@ PanelWindow {
           Text {
             id: heroIcon
             textFormat: Text.PlainText
-            text: root.internal ? "󰌢" : "󰍹"
+            text: root.internal ? "󰌢" : (root.virtualHead ? "󰖩" : "󰍹")
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.display
@@ -628,6 +647,239 @@ PanelWindow {
           PillRow { row: "vrr"; options: root.vrrOptions; value: String(root.stagedVrr) }
         }
 
+        Column {
+          visible: root.virtualHead && root.miracast
+          width: parent.width
+          spacing: Style.space(10)
+
+          PanelSeparator { foreground: root.foreground; width: parent.width }
+
+          SectionHeader { text: "SESSION" }
+
+          Row {
+            width: parent.width
+            spacing: Style.spacing.sm
+            Text {
+              text: root.miracast && root.miracast.preserveDisplayAcrossMonitors ? "󰄬" : "󰄱"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: if (root.miracast)
+                  root.miracast.setPreserveDisplayAcrossMonitors(!root.miracast.preserveDisplayAcrossMonitors)
+              }
+            }
+            Text {
+              text: "Persist display across monitors"
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              width: parent.width - parent.spacing - 28
+              wrapMode: Text.WordWrap
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: if (root.miracast)
+                  root.miracast.setPreserveDisplayAcrossMonitors(!root.miracast.preserveDisplayAcrossMonitors)
+              }
+            }
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.spacing.sm
+            Text {
+              text: root.miracast && root.miracast.autoSwitchAudioOutput ? "󰄬" : "󰄱"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: if (root.miracast)
+                  root.miracast.setAutoSwitchAudioOutput(!root.miracast.autoSwitchAudioOutput)
+              }
+            }
+            Text {
+              text: "Automatically switch audio output"
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              width: parent.width - parent.spacing - 28
+              wrapMode: Text.WordWrap
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: if (root.miracast)
+                  root.miracast.setAutoSwitchAudioOutput(!root.miracast.autoSwitchAudioOutput)
+              }
+            }
+          }
+
+          Item {
+            width: parent.width
+            implicitHeight: advHdr.implicitHeight + (root.miracastAdvancedOpen ? advBody.implicitHeight + Style.space(10) : 0)
+
+            MouseArea {
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              height: advHdr.implicitHeight
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.miracastAdvancedOpen = !root.miracastAdvancedOpen
+            }
+
+            Row {
+              id: advHdr
+              width: parent.width
+              spacing: Style.spacing.sm
+
+              Text {
+                text: root.miracastAdvancedOpen ? "󰅀" : "󰅂"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Text {
+                text: "ADVANCED SETTINGS"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.2
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+          Column {
+            id: advBody
+            visible: root.miracastAdvancedOpen
+            y: advHdr.height + Style.space(10)
+            width: parent.width
+            spacing: Style.space(10)
+
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+            visible: root.miracast && root.miracast.streamModes && root.miracast.streamModes.length > 0
+            SectionHeader { text: "STREAM MODE" }
+            Flow {
+              width: parent.width
+              spacing: Style.spacing.xs
+              Repeater {
+                model: root.miracast ? root.miracast.streamModes : []
+                Button {
+                  required property var modelData
+                  text: root.miracast ? root.miracast.streamModeLabel(modelData && modelData.id) : ""
+                  fontSize: Style.font.caption
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  active: root.miracast && root.miracast.streamMode === (modelData && modelData.id)
+                  enabled: root.miracast && !root.miracast.busy
+                  onClicked: if (root.miracast) root.miracast.setStreamMode(modelData ? modelData.id : "")
+                }
+              }
+            }
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+            SectionHeader { text: "ENCODING STRATEGY" }
+            Row {
+              spacing: Style.spacing.xs
+              Repeater {
+                model: Model.miracastEncodeStrategyValues()
+                Button {
+                  required property string modelData
+                  text: Model.miracastEncodeStrategyLabel(modelData)
+                  fontSize: Style.font.caption
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  active: root.miracast && root.miracast.encodeStrategy === modelData
+                  onClicked: if (root.miracast) root.miracast.setEncodeStrategy(modelData)
+                }
+              }
+            }
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+            SectionHeader { text: "RENDER ENGINE" }
+            Row {
+              spacing: Style.spacing.xs
+              Repeater {
+                model: Model.miracastCaptureEncodeValues()
+                Button {
+                  required property string modelData
+                  text: Model.miracastCaptureEncodePillTitle(modelData)
+                  fontSize: Style.font.caption
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  active: root.miracast && root.miracast.captureEncode === modelData
+                  onClicked: if (root.miracast) root.miracast.setCaptureEncode(modelData)
+                }
+              }
+            }
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+            SectionHeader { text: "PRESET QUALITY" }
+            Flow {
+              width: parent.width
+              spacing: Style.spacing.xs
+              Repeater {
+                model: Model.miracastEncodeProfileValues()
+                Button {
+                  required property string modelData
+                  text: Model.miracastEncodeProfileLabel(modelData)
+                  fontSize: Style.font.caption
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  active: root.miracast && root.miracast.encodeProfile === modelData
+                  onClicked: if (root.miracast) root.miracast.setEncodeProfile(modelData)
+                }
+              }
+            }
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+            visible: root.miracast && root.miracast.p2pWifiPrimaryValues && root.miracast.p2pWifiPrimaryValues.length > 0
+            SectionHeader { text: "RADIO" }
+            Flow {
+              width: parent.width
+              spacing: Style.spacing.xs
+              Repeater {
+                model: root.miracast ? root.miracast.p2pWifiPrimaryValues : []
+                Button {
+                  required property string modelData
+                  text: modelData === "auto" ? "Auto" : modelData
+                  fontSize: Style.font.caption
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  active: root.miracast && root.miracast.p2pWifiInterface === modelData
+                  onClicked: if (root.miracast) root.miracast.setP2pWifiInterface(modelData)
+                }
+              }
+            }
+          }
+          }
+          }
+        }
+
         // ---------- Actions ----------
         PanelSeparator { foreground: root.foreground }
 
@@ -675,6 +927,7 @@ PanelWindow {
             }
           }
         }
+      }
       }
     }
   }

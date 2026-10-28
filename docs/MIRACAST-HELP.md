@@ -1,7 +1,9 @@
 # Miracast / Wi‑Fi Display — quick guide
 
 Cast this Omarchy desktop to a TV or dongle over **Wi‑Fi Direct** (not your
-normal Wi‑Fi SSID). Video is H.264; audio is typically LPCM on many TVs.
+normal Wi‑Fi SSID). Video is H.264. Audio is **LPCM** when the sink lists it
+(cheap dongles often LPCM-only); otherwise AAC. If you have picture but no
+sound, the stick likely wants LPCM — FluxCast should log `negotiating WFD LPCM`.
 
 Press **q** (or Ctrl+C) to close this window.
 
@@ -34,8 +36,9 @@ Optional: **UFW** — if enabled, Miracast ports must be allowed (see below).
 **Persist display** — keep the Extend desktop when switching TVs.  
 **Automatically switch audio** — after the cast is *streaming*, set default output to Miracast (speakers stay default during connect).
 
-**ADVANCED SETTINGS** — stream mode, render engine (**GPU + DMA-BUF** / **GPU** / **CPU**),
-preset quality, P2P radio.
+Place the Miracast tile on the **ARRANGEMENT** canvas. Double-click it (or **I**)
+for scale, stream, encode, and radio. Scan / Doctor / Info / Stop stay on the
+**MIRACAST** row.
 
 ---
 

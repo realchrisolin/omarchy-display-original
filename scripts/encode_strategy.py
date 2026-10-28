@@ -32,8 +32,9 @@ def bitrate_to_mbps(text: Any) -> float:
     return v
 
 
-# QVBR quality-first HRD (~2 s of peak). Intel QVBR underspends at 0.25 s.
-QVBR_VBV_MULTIPLIER = 2.0
+# Seconds cap for HRD. FluxCast sizes bufsize from ~4 frames inside this cap
+# so QVBR undershoot cannot turn 0.25 s of peak into many seconds of delay.
+QVBR_VBV_MULTIPLIER = 0.1
 # 1.0 = I-frames same quantizer as P. CQP High's 1.3 coarsens IDR and leaked
 # into QVBR via encodeProfileEffective=high.
 QVBR_I_QFACTOR = "1.0"
@@ -106,9 +107,12 @@ def prepare_dmabuf_settings(settings: dict[str, Any]) -> dict[str, Any]:
     settings["encodeStrategyFallback"] = ""
     if strat == "smartview":
         settings["vaapiIQfactor"] = QVBR_I_QFACTOR
+        rc = str(settings.get("vaapiRcMode") or "QVBR").strip().upper()
+        if rc not in ("QVBR", "CBR", "VBR"):
+            rc = "QVBR"
+        settings["vaapiRcMode"] = rc
     if strat == "smartview" and not settings.get("encodeStrategyPinnedEngine"):
         settings["captureEncode"] = "dmabuf"
-        settings["vaapiRcMode"] = "QVBR"
         settings["encodeStrategyAbr"] = "sv"
         try:
             q = int(str(settings.get("vaapiQuality") or "3"))
@@ -125,8 +129,26 @@ def prepare_dmabuf_settings(settings: dict[str, Any]) -> dict[str, Any]:
             settings["encodeWfdBitrateMbps"] = 8.0
         settings["vaapiAsyncDepth"] = 1
         sm = str(settings.get("streamMode") or "")
-        settings["vaapiGop"] = 30 if ("p30" in sm and "p60" not in sm) else 60
-        settings["vbvMultiplier"] = f"{QVBR_VBV_MULTIPLIER:.1f}"
+        one_sec = 30 if ("p30" in sm and "p60" not in sm) else 60
+        rc_now = str(settings.get("vaapiRcMode") or "").upper()
+        try:
+            gop_now = int(settings.get("vaapiGop")) if settings.get("vaapiGop") not in (None, "") else None
+        except (TypeError, ValueError):
+            gop_now = None
+        if rc_now == "CBR":
+            # Keep an explicit GOP (15 = 0.25 s at 60 fps). Only replace 1 s leftovers.
+            if gop_now is None or gop_now >= 60 or gop_now <= 8:
+                settings["vaapiGop"] = 15 if one_sec >= 60 else 8
+            try:
+                vbv_now = float(settings.get("vbvMultiplier") or 0)
+            except (TypeError, ValueError):
+                vbv_now = 0.0
+            if vbv_now < 0.2:
+                settings["vbvMultiplier"] = "0.25"
+        else:
+            if gop_now is None:
+                settings["vaapiGop"] = one_sec
+            settings["vbvMultiplier"] = f"{QVBR_VBV_MULTIPLIER:g}"
     return {
         "encodeStrategy": strat,
         "captureEncode": settings.get("captureEncode"),
@@ -176,7 +198,7 @@ def apply_to_settings(
             settings["vaapiBitrate"] = settings.get("bitrate") or "8M"
         if settings.get("encodeWfdBitrateMbps") is None:
             settings["encodeWfdBitrateMbps"] = 8.0
-        settings["vbvMultiplier"] = f"{QVBR_VBV_MULTIPLIER:.1f}"
+        settings["vbvMultiplier"] = f"{QVBR_VBV_MULTIPLIER:g}"
         settings["vaapiIQfactor"] = QVBR_I_QFACTOR
         if retarget_engine and not settings.get("encodeStrategyPinnedEngine"):
             # Attempt DMA-BUF first; starve watchdog may flip to vaapi.

@@ -309,9 +309,11 @@ reconnect, compare Hyprland CPU.
 ### 6. Miracast audio (desktop → TV speakers)
 
 No extra *build* step — this is runtime wiring once FluxCast patches above are
-in use. Many cheap dongles advertise **LPCM only**; AAC-in-TS then gives picture
-but silent speakers. The patched FluxCast path negotiates WFD LPCM
-(`stream_type=0x83`) for those sinks.
+in use. Many cheap dongles advertise **LPCM only** (`LPCM 00000002 00`);
+AAC-in-TS then gives picture but silent speakers. FluxCast muxes WFD LPCM
+(`stream_type=0x83`) **whenever the sink lists LPCM**, including when an air
+budget check would have preferred AAC. `FLUXCAST_WFD_FORCE_AAC=1` is the
+escape hatch (often silent on LPCM-only sticks).
 
 | Piece | What to do |
 |-------|------------|
@@ -322,8 +324,8 @@ but silent speakers. The patched FluxCast path negotiates WFD LPCM
 | **Volume** | Keep the Miracast sink near **100%** (`pactl set-sink-volume miracast 100%`). A low sink volume is captured as quiet PCM and sounds “faded” on the TV. |
 | **Verify** | In `cast.log`: `Capturing audio : miracast.monitor (sink monitor via pw-cat — not mic)` and `negotiating WFD LPCM`. Expect `wf-recorder` **and** a `pw-cat … --target miracast.monitor` process while streaming. |
 
-Escape hatch (picture-only debug): `FLUXCAST_WFD_FORCE_AAC=1` forces the stable
-DMA+AAC path — often silent on LPCM-only TVs.
+`FLUXCAST_WFD_FORCE_AAC=1` forces DMA+AAC even if the sink listed LPCM —
+use only as a debug hatch; hotyeah / Realtek sticks stay silent on AAC.
 
 Design notes (AOSP-inspired wire layout, not a build recipe):
 [docs/aosp-wfd-audio-notes.md](docs/aosp-wfd-audio-notes.md),

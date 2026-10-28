@@ -634,10 +634,12 @@ Panel {
       onActivateRequested: if (root.cursorActive) root.activateCursor()
       // arrangement: I opens the properties of the tile under the cursor.
       onTextKey: function(text) {
+        if (text === "i" || text === "I") {
+          arrangement.showProperties()
+          return
+        }
         if (miracastSection.handleTextKey(text))
           return
-        if (root.cursorActive && root.focusSection === "arrangement" && (text === "i" || text === "I"))
-          arrangement.showProperties()
       }
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
@@ -730,6 +732,7 @@ Panel {
             focused: root.focusSection === "arrangement"
             cursorActive: root.cursorActive
             panel: panel
+            miracast: miracastSection.service
             onFocusRequested: if (!root.reflowingText) {
               root.cursorActive = true
               root.focusSection = "arrangement"

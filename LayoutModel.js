@@ -41,8 +41,8 @@ function isInternal(monitor) {
   return INTERNAL_OUTPUT.test(String((monitor && monitor.name) || ""))
 }
 
-// Miracast Extend heads (Hyprland headless). Layout must not compact, drag,
-// or park these — miracast-ctl owns park (-12000) and place (beside eDP).
+// Miracast Extend heads (Hyprland headless). Packed in computePositions.
+// hl.monitor / lua skip them. miracast-ctl parks at -12000 and places at packed x,y.
 var VIRTUAL_OUTPUT = /^(HEADLESS|persistent-miracast|Miracast)/
 
 function isVirtualHead(monitor) {
@@ -61,13 +61,12 @@ function isParkedVirtual(monitor) {
   return (Number(monitor.x) || 0) <= -10000
 }
 
-// Physical arrangeable outputs, plus a live (unparked) Miracast head so the
-// display dropdown preview shows the TV next to eDP. Layout apply still uses
-// isArrangeable only.
+// Physical arrangeable outputs, plus the Miracast HEADLESS head (parked or
+// live) so DISPLAY SETTINGS can place it. Layout apply still uses isArrangeable
+// only; place-virtual-head owns the real output.
 function isPreviewable(monitor) {
   if (isArrangeable(monitor)) return true
   if (!isVirtualHead(monitor)) return false
-  if (isParkedVirtual(monitor)) return false
   var w = Number(monitor.width) || 0
   var h = Number(monitor.height) || 0
   return w > 0 && h > 0
@@ -92,6 +91,10 @@ function isArrangeable(monitor) {
   if (isVirtualHead(monitor)) return false
   var mirrorOf = monitor.mirrorOf
   return mirrorOf === undefined || mirrorOf === null || mirrorOf === "" || mirrorOf === "none"
+}
+
+function isPackable(monitor) {
+  return isArrangeable(monitor) || (isVirtualHead(monitor) && isPreviewable(monitor))
 }
 
 function logicalSize(monitor) {
@@ -461,7 +464,11 @@ function settingsRule(name, settings) {
 // the same way rank() looks up a saved order entry: by monitorKey first,
 // falling back to the output name.
 function pendingSettings(monitors, layout) {
-  var list = (monitors || []).filter(function(monitor) { return monitor && !monitor.disabled })
+  var list = (monitors || []).filter(function(monitor) {
+    if (!monitor) return false
+    if (isArrangeable(monitor)) return true
+    return isVirtualHead(monitor) && isPreviewable(monitor)
+  })
   var shared = sharedDescriptions(list)
   var monitorSettings = (layout && layout.monitors) || {}
   var result = []
@@ -585,6 +592,27 @@ function rotationLabel(transform) {
 
 // Keys placed by the user come first; remembered monitors that are not
 // connected right now keep their relative order after them.
+// Insert the Miracast head into layout.order once. Default: right of the
+// packed hardware row. Ignore leftover extendPosition when USB-C already
+// occupies the left of eDP.
+function migrateLayoutOrder(layout, monitors) {
+  var copy = copyLayout(layout)
+  var virt = null
+  for (var i = 0; i < (monitors || []).length; i++) {
+    if (isVirtualHead(monitors[i]) && isPreviewable(monitors[i])) {
+      virt = monitors[i]
+      break
+    }
+  }
+  if (!virt) return copy
+  var shared = sharedDescriptions((monitors || []).filter(isPackable))
+  var key = String(virt.name || "persistent-miracast")
+  var order = (copy.order || []).slice()
+  if (order.indexOf(key) >= 0) return copy
+  copy.order = order.concat([key])
+  return copy
+}
+
 function mergeOrder(keys, previous) {
   var merged = keys.slice()
   for (var i = 0; i < (previous || []).length; i++) {
@@ -602,7 +630,7 @@ function rank(order, monitor, shared) {
 // Monitors in the saved order come first, in that order. Unknown ones follow,
 // keeping their current left-to-right position.
 function sortMonitors(monitors, order) {
-  var list = (monitors || []).filter(isArrangeable).slice()
+  var list = (monitors || []).filter(isPackable).slice()
   var shared = sharedDescriptions(list)
   order = order || []
   list.sort(function(a, b) {
@@ -621,7 +649,7 @@ function sortMonitors(monitors, order) {
 // the one it stands on are both arrangeable, and following `on` never loops.
 // { key: { on, side } } keyed like the row (monitorKey).
 function activeStack(monitors, stack) {
-  var list = (monitors || []).filter(isArrangeable)
+  var list = (monitors || []).filter(isPackable)
   var shared = sharedDescriptions(list)
   var present = {}
   list.forEach(function(monitor) { present[monitorKey(monitor, shared)] = true })
@@ -646,7 +674,7 @@ function activeStack(monitors, stack) {
 // monitor they stand on. Everything is shifted so the layout starts at 0x0.
 function computePositions(monitors, order, stack, monitorSettings) {
   var active = activeStack(monitors, stack)
-  var list = (monitors || []).filter(isArrangeable)
+  var list = (monitors || []).filter(isPackable)
   var shared = sharedDescriptions(list)
   var byKey = {}
   list.forEach(function(monitor) {
@@ -832,15 +860,26 @@ function luaString(value) {
 // where they are going. Staging monitors there keeps the move overlap-free.
 function stagingX(monitors, positions, monitorSettings) {
   var right = 0
-  var list = (monitors || []).filter(isArrangeable)
-  var shared = sharedDescriptions(list)
+  var list = (monitors || []).filter(isPackable)
+  var shared = sharedDescriptions(list.filter(isArrangeable))
   for (var i = 0; i < list.length; i++) {
-    var geom = withSavedGeometry(list[i], shared, monitorSettings)
+    var geom = isVirtualHead(list[i]) ? list[i] : withSavedGeometry(list[i], shared, monitorSettings)
     right = Math.max(right, (Number(list[i].x) || 0) + logicalSize(geom).w)
+  }
+  for (var p = 0; p < (positions || []).length; p++) {
+    var w = Number(positions[p].w)
+    if (!(w > 0)) {
+      var mon = null
+      for (var m = 0; m < list.length; m++) {
+        if (String(list[m].name) === String(positions[p].name)) { mon = list[m]; break }
+      }
+      w = mon ? logicalSize(isVirtualHead(mon) ? mon : withSavedGeometry(mon, shared, monitorSettings)).w : 0
+    }
+    right = Math.max(right, (Number(positions[p].x) || 0) + w)
   }
   var total = 0
   for (var j = 0; j < list.length; j++)
-    total += logicalSize(withSavedGeometry(list[j], shared, monitorSettings)).w
+    total += logicalSize(isVirtualHead(list[j]) ? list[j] : withSavedGeometry(list[j], shared, monitorSettings)).w
   return Math.max(right, total)
 }
 
@@ -864,12 +903,18 @@ function positionRule(name, x, y) {
 // returning monitor appear beside the layout instead.
 function positionsToLua(positions, staging, parked) {
   var lines = []
+  var phys = (positions || []).filter(function(p) { return !isVirtualHead({ name: p.name }) })
+  var virt = (positions || []).filter(function(p) { return isVirtualHead({ name: p.name }) })
   if (staging !== undefined && staging !== null) {
-    for (var i = 0; i < positions.length; i++)
-      lines.push(positionRule(positions[i].name, staging + positions[i].x, positions[i].y))
+    for (var i = 0; i < phys.length; i++)
+      lines.push(positionRule(phys[i].name, staging + phys[i].x, phys[i].y))
   }
-  for (var j = 0; j < positions.length; j++)
-    lines.push(positionRule(positions[j].name, positions[j].x, positions[j].y))
+  // Move the Miracast head while physical outputs are still staged, so eDP
+  // never lands on the TV's old x (Hyprland "monitor layout overlaps").
+  for (var v = 0; v < virt.length; v++)
+    lines.push(positionRule(virt[v].name, virt[v].x, virt[v].y))
+  for (var j = 0; j < phys.length; j++)
+    lines.push(positionRule(phys[j].name, phys[j].x, phys[j].y))
   for (var k = 0; k < (parked || []).length; k++)
     lines.push("hl.monitor({ output = " + luaString(parked[k]) + ", position = \"auto-right\" })")
   return lines.join("\n")
@@ -909,10 +954,14 @@ function dropIndex(tiles, from, offset) {
 // View model for the panel: arrangeable monitors sorted by current position,
 // left to right then top to bottom. `stacked` marks the ones standing on
 // another monitor (see activeStack).
-function tilesFromMonitors(monitors, stack, monitorSettings) {
+function tilesFromMonitors(monitors, stack, monitorSettings, order) {
+  var layoutOrder = order || []
+  var packed = computePositions(monitors, layoutOrder, stack, monitorSettings)
+  var byName = {}
+  for (var p = 0; p < packed.length; p++) byName[packed[p].name] = packed[p]
   var active = activeStack(monitors, stack)
   var previewable = (monitors || []).filter(isPreviewable)
-  var shared = sharedDescriptions(previewable.filter(isArrangeable))
+  var shared = sharedDescriptions(previewable.filter(isPackable))
   var labelCount = {}
   previewable.forEach(function(monitor) {
     var label = tileLabel(monitor)
@@ -924,23 +973,85 @@ function tilesFromMonitors(monitors, stack, monitorSettings) {
     var label = tileLabel(monitor)
     var virtual = isVirtualHead(monitor)
     var key = virtual ? String(monitor.name) : monitorKey(monitor, shared)
+    var slot = byName[String(monitor.name)]
     return {
       name: String(monitor.name),
       key: key,
-      // Identical models get their port appended: "P2419H · DP-1".
       label: labelCount[label] > 1 ? label + " · " + monitor.name : label,
       internal: isInternal(monitor),
       virtual: virtual,
       focused: monitor.focused === true,
       stacked: virtual ? false : !!active[monitorKey(monitor, shared)],
-      x: Number(monitor.x) || 0,
-      y: Number(monitor.y) || 0,
+      x: slot ? slot.x : (Number(monitor.x) || 0),
+      y: slot ? slot.y : (Number(monitor.y) || 0),
       w: size.w,
       h: size.h
     }
   })
   list.sort(function(a, b) { return a.x - b.x || a.y - b.y })
   return list
+}
+
+// Put the Miracast tile outside the packed physical row. Placing it only
+// against eDP overlapped USB-C when that panel already sat left of the laptop.
+function applyExtendPreview(tiles, extendPosition) {
+  var virt = null
+  var left = Infinity
+  var right = -Infinity
+  var top = Infinity
+  var bottom = -Infinity
+  var rowY = 0
+  for (var i = 0; i < (tiles || []).length; i++) {
+    if (tiles[i].virtual) { virt = tiles[i]; continue }
+    left = Math.min(left, tiles[i].x)
+    right = Math.max(right, tiles[i].x + tiles[i].w)
+    top = Math.min(top, tiles[i].y)
+    bottom = Math.max(bottom, tiles[i].y + tiles[i].h)
+    if (tiles[i].internal) rowY = tiles[i].y
+  }
+  if (!virt || left === Infinity) return tiles
+  var pos = String(extendPosition || "right")
+  if (pos === "left") {
+    virt.x = left - virt.w
+    virt.y = rowY
+  } else if (pos === "above") {
+    virt.x = left + Math.round((right - left - virt.w) / 2)
+    virt.y = top - virt.h
+  } else if (pos === "below") {
+    virt.x = left + Math.round((right - left - virt.w) / 2)
+    virt.y = bottom
+  } else {
+    virt.x = right
+    virt.y = rowY
+  }
+  return tiles
+}
+
+// Map an Arrangement drop of the Miracast tile to extendPosition.
+function extendPositionFromDrop(tiles, from, target, dx) {
+  if (!tiles || from < 0 || from >= tiles.length) return ""
+  var virt = tiles[from]
+  if (!virt || !virt.virtual) return ""
+  var edp = null
+  for (var i = 0; i < tiles.length; i++) {
+    if (tiles[i].internal) { edp = tiles[i]; break }
+  }
+  if (!edp) return "right"
+  if (target && (target.side === "above" || target.side === "below") && target.on === edp.key)
+    return target.side
+  var cx = virt.x + (Number(dx) || 0) + virt.w / 2
+  var left = Infinity
+  var right = -Infinity
+  for (var j = 0; j < tiles.length; j++) {
+    if (tiles[j].virtual) continue
+    left = Math.min(left, tiles[j].x)
+    right = Math.max(right, tiles[j].x + tiles[j].w)
+  }
+  if (left === Infinity) {
+    var ecx = edp.x + edp.w / 2
+    return cx < ecx ? "left" : "right"
+  }
+  return cx < (left + right) / 2 ? "left" : "right"
 }
 
 // The Display panel's DISPLAYS rows with one output switched on or off, before
@@ -1017,7 +1128,11 @@ if (typeof module !== "undefined") {
     parkedOutputs: parkedOutputs,
     moveItem: moveItem,
     dropIndex: dropIndex,
+    isPackable: isPackable,
+    migrateLayoutOrder: migrateLayoutOrder,
     tilesFromMonitors: tilesFromMonitors,
+    applyExtendPreview: applyExtendPreview,
+    extendPositionFromDrop: extendPositionFromDrop,
     withDisplayEnabled: withDisplayEnabled
   }
 }

@@ -1053,13 +1053,27 @@ extend_geometry_parts() {
   local extend_res
   [[ -f "$HEADLESS_FILE" ]] && tracked="$(cat "$HEADLESS_FILE" 2>/dev/null || true)"
   extend_res="$(extend_resolution)"
-  python3 - "$position" "$tracked" "$extend_res" "$SETTINGS_FILE" "$prefer_scale" <<'PY'
+  python3 - "$position" "$tracked" "$extend_res" "$SETTINGS_FILE" "$prefer_scale" "$MODE_STATE_FILE" "$PLUGIN_DIR/scripts/headless_refresh.py" <<'PY'
 import json, subprocess, sys
+from pathlib import Path
 pos = sys.argv[1]
 tracked = sys.argv[2] if len(sys.argv) > 2 else ""
 extend_res = sys.argv[3] if len(sys.argv) > 3 else "1280x720"
 settings_path = sys.argv[4] if len(sys.argv) > 4 else ""
 prefer_scale = sys.argv[5].strip() if len(sys.argv) > 5 else ""
+mode_state_path = sys.argv[6] if len(sys.argv) > 6 else ""
+helper = sys.argv[7] if len(sys.argv) > 7 else ""
+if helper:
+    sys.path.insert(0, str(Path(helper).resolve().parent))
+try:
+    from headless_refresh import advertised_hz, pick_headless_refresh, want_fps_from_state
+except Exception:
+    def advertised_hz(modes):
+        return []
+    def pick_headless_refresh(want, advertised, default=60):
+        return int(default)
+    def want_fps_from_state(modes, settings):
+        return 60
 try:
     ew, eh = [int(x) for x in extend_res.split("x", 1)]
 except Exception:
@@ -1120,28 +1134,26 @@ if vs <= 0:
     vs = 1.0
 hlw = int(round(hw / vs))
 hlh = int(round(hh / vs))
-# Match Extend refresh to stream mode fps (streamMode …pN or settings.fps).
-# Faster head vs encode overproduces ICC frames → chop / buffer-pool drops.
-refresh = 30
+# Match Extend refresh to the live RTSP fps when the output advertises it.
+# Hyprland HEADLESS typically only lists 60Hz — forcing 30Hz there stalls
+# ICC capture (wf-recorder paces at 60) and the ffmpeg IO watchdog rebinds
+# every ~12s. Prefer sink-modes.json current over settings.streamMode.
 try:
     settings = json.load(open(settings_path)) if settings_path else {}
 except Exception:
     settings = {}
 try:
-    mid = str(settings.get("streamMode") or "")
-    import re as _re
-    m = _re.fullmatch(r"(\d+)x(\d+)p(\d+)", mid)
-    if m:
-        refresh = int(m.group(3))
-    else:
-        refresh = int(float(settings.get("fps") or settings.get("extendRefresh") or 30))
+    mode_state = json.load(open(mode_state_path)) if mode_state_path else {}
 except Exception:
-    try:
-        refresh = int(float(settings.get("extendRefresh") or 30))
-    except Exception:
-        refresh = 30
-if refresh < 1:
-    refresh = 30
+    mode_state = {}
+want = want_fps_from_state(mode_state, settings)
+advertised = advertised_hz(virtual.get("availableModes") or []) if virtual else []
+refresh = pick_headless_refresh(want, advertised)
+if advertised and refresh != want:
+    print(
+        f"[miracast-ctl] headless refresh want={want} advertised={advertised} using={refresh}",
+        file=sys.stderr,
+    )
 
 if pos == "left":
     x, y = -hlw, max(0, (plh - hlh) // 2)
@@ -1152,6 +1164,89 @@ elif pos == "below":
 else:  # right
     x, y = plw, max(0, (plh - hlh) // 2)
 print(f"{hw}x{hh}@{refresh}|{x}x{y}|{vs:g}")
+PY
+}
+
+# Packed x y for the HEADLESS head: same row as USB-C/eDP from monitor-layout.json.
+# Ignores leftover extendPosition. Default: right of the hardware row.
+pack_virtual_xy() {
+  python3 - "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/monitor-layout.json" <<'PY'
+import json, subprocess, sys
+from pathlib import Path
+
+def is_virt(n):
+    n = str(n or "")
+    return (
+        n.startswith("HEADLESS")
+        or n == "persistent-miracast"
+        or n.startswith("persistent-miracast-")
+        or n == "Miracast"
+        or n.startswith("Miracast-")
+    )
+
+layout_path = Path(sys.argv[1])
+try:
+    layout = json.loads(layout_path.read_text())
+except Exception:
+    layout = {}
+order = list(layout.get("order") or [])
+saved = layout.get("monitors") or {}
+ms = json.loads(subprocess.check_output(["hyprctl", "-j", "monitors"], text=True, timeout=3))
+virt = next((m for m in ms if is_virt(m.get("name"))), None)
+if virt is None:
+    print("0 0")
+    raise SystemExit
+vname = str(virt.get("name") or "persistent-miracast")
+if vname not in order:
+    order.append(vname)
+by_key = {vname: virt}
+for m in ms:
+    if is_virt(m.get("name")):
+        continue
+    name = str(m.get("name") or "")
+    desc = " ".join(
+        p for p in (m.get("make"), m.get("model"), m.get("serial")) if p
+    ).strip() or str(m.get("description") or name)
+    by_key[desc] = m
+    by_key[name] = m
+
+def logical(m):
+    name = str(m.get("name") or "")
+    desc = " ".join(
+        p for p in (m.get("make"), m.get("model"), m.get("serial")) if p
+    ).strip() or str(m.get("description") or name)
+    s = saved.get(desc) or saved.get(name) or {}
+    try:
+        scale = float(s.get("scale") if s.get("scale") is not None else (m.get("scale") or 1)) or 1.0
+    except (TypeError, ValueError):
+        scale = 1.0
+    try:
+        t = int(s["transform"]) if s.get("transform") is not None else int(m.get("transform") or 0)
+    except (TypeError, ValueError):
+        t = 0
+    w, h = int(m.get("width") or 1920), int(m.get("height") or 1080)
+    if t % 2:
+        w, h = h, w
+    return int(round(w / scale)), int(round(h / scale))
+
+x = 0
+vx, vy = 0, 0
+seen = set()
+for key in order:
+    m = by_key.get(key)
+    if m is None:
+        continue
+    name = str(m.get("name") or "")
+    if name in seen:
+        continue
+    seen.add(name)
+    w, _h = logical(m)
+    if is_virt(name):
+        vx, vy = x, 0
+    x += w
+if vname not in seen:
+    vx, vy = x, 0
+print(f"{vx} {vy}")
 PY
 }
 
@@ -1676,13 +1771,14 @@ except Exception:
   print("")
 ' "$SETTINGS_FILE" 2>/dev/null || true)"
   saved_scale="$(extend_scale_get "$peer_mac")"
-  parts="$(extend_geometry_parts "$position" "$saved_scale")"
+  parts="$(extend_geometry_parts "right" "$saved_scale")"
   mode="${parts%%|*}"
   rest="${parts#*|}"
-  pos="${rest%%|*}"
   scale="${rest#*|}"
   [[ "$scale" == "$rest" || -z "$scale" ]] && scale="${saved_scale:-1}"
-  # Keep refresh from extend_geometry_parts (matches stream fps).
+  packed="$(pack_virtual_xy 2>/dev/null || true)"
+  pos="${packed/ /x}"
+  [[ "$pos" == *"x"* ]] || pos="0x0"
 
   # Same safe order as monitor-scale: leave the cast output, detach capture,
   # move geometry, then *force* rebuild (zombies looked "alive" and skipped rebind).
@@ -1737,16 +1833,20 @@ except Exception:
     print("")
 ' 2>/dev/null || true)"
 
-  if connecting_lock_fresh && [[ "$phase" != "streaming" ]]; then
+  # Modeset is unsafe during P2P/DHCP. After PLAY, FluxCast is up and
+  # HEADLESS refresh must match negotiated encode fps. Phase often stays
+  # "rtsp" until first air TX — do not skip then or a 30Hz/60fps mismatch
+  # can never be corrected (capture stall → no TX → phase stuck).
+  if [[ "$phase" == "connecting" || "$phase" == "dhcp" ]]; then
     emit "{\"ok\":true,\"applied\":false,\"reason\":\"handshake\",\"monitor\":\"$name\"}"
     return 0
   fi
-  if [[ "$phase" == "connecting" || "$phase" == "dhcp" || "$phase" == "rtsp" ]]; then
+  if connecting_lock_fresh && [[ "$phase" != "streaming" ]] && ! fluxcast_python_running; then
     emit "{\"ok\":true,\"applied\":false,\"reason\":\"handshake\",\"monitor\":\"$name\"}"
     return 0
   fi
 
-  if [[ "$phase" == "streaming" ]] || is_running || fluxcast_python_running; then
+  if [[ "$phase" == "streaming" || "$phase" == "rtsp" ]] || is_running || fluxcast_python_running; then
     local position parts mode pos scale rest saved_scale peer_mac
     position="$(extend_position)"
     peer_mac="$(python3 -c 'import json,sys
@@ -1754,34 +1854,63 @@ try: print(json.load(open(sys.argv[1])).get("lastPeerMac") or "")
 except Exception: print("")
 ' "$SETTINGS_FILE" 2>/dev/null || true)"
     saved_scale="$(extend_scale_get "$peer_mac")"
-    parts="$(extend_geometry_parts "$position" "$saved_scale")"
+    parts="$(extend_geometry_parts "right" "$saved_scale")"
     mode="${parts%%|*}"
     rest="${parts#*|}"
-    pos="${rest%%|*}"
     scale="${rest#*|}"
     [[ "$scale" == "$rest" || -z "$scale" ]] && scale="${saved_scale:-1}"
-    if python3 - "$name" "$pos" <<'PY'
-import json, sys
-name, want = sys.argv[1], sys.argv[2]
+    local packed=""
+    packed="$(pack_virtual_xy 2>/dev/null || true)"
+    pos="${packed/ /x}"
+    [[ "$pos" == *"x"* ]] || pos="0x0"
+    local place_kind=""
+    place_kind="$(python3 - "$name" "$pos" "$mode" <<'PY'
+import json, re, subprocess, sys
+name, want, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 wx, wy = want.split("x", 1)
 wx, wy = int(wx), int(wy)
-import subprocess
+want_hz = 60.0
+m = re.search(r"@([0-9.]+)", mode or "")
+if m:
+    want_hz = float(m.group(1))
 raw = subprocess.check_output(["hyprctl", "-j", "monitors"], text=True, timeout=3)
-for m in json.loads(raw):
-    if str(m.get("name") or "") != name:
+for mon in json.loads(raw):
+    if str(mon.get("name") or "") != name:
         continue
-    raise SystemExit(0 if int(m.get("x") or 0) == wx and int(m.get("y") or 0) == wy else 1)
-raise SystemExit(1)
+    live_hz = float(mon.get("refreshRate") or 0)
+    xy_ok = int(mon.get("x") or 0) == wx and int(mon.get("y") or 0) == wy
+    hz_ok = abs(live_hz - want_hz) < 1.0
+    if xy_ok and hz_ok:
+        print("already")
+    elif hz_ok:
+        print("xy")
+    else:
+        print("mode")
+    raise SystemExit(0)
+print("missing")
 PY
-    then
-      emit "{\"ok\":true,\"applied\":false,\"reason\":\"already-placed\",\"monitor\":\"$name\",\"pos\":\"$pos\"}"
+)"
+    place_kind="${place_kind//$'\n'/}"
+    place_kind="${place_kind:-mode}"
+    if [[ "$place_kind" == "already" ]]; then
+      emit "{\"ok\":true,\"applied\":false,\"reason\":\"already-placed\",\"monitor\":\"$name\",\"pos\":\"$pos\",\"mode\":\"$mode\"}"
       return 0
     fi
-    hypr_set_monitor_geometry "$name" "$mode" "$pos" "$scale" >/dev/null 2>&1 || true
-    if [[ "$phase" == "streaming" ]]; then
-      ensure_extend_capture_healthy 2 >/dev/null || true
+    # wf-recorder -o <name> follows the output, not x,y. Position-only
+    # moves must not SIGUSR1 capture (that rebuilt AAC+aresample and lag).
+    if [[ "$place_kind" == "xy" ]]; then
+      hypr_set_monitor_geometry "$name" "$mode" "$pos" "$scale" >/dev/null 2>&1 || true
+      emit "{\"ok\":true,\"applied\":true,\"reason\":\"moved\",\"monitor\":\"$name\",\"pos\":\"$pos\",\"mode\":\"$mode\"}"
+      return 0
     fi
-    emit "{\"ok\":true,\"applied\":true,\"reason\":\"placed\",\"monitor\":\"$name\",\"pos\":\"$pos\"}"
+    pause_extend_capture >/dev/null || true
+    wait_capture_senders_gone 40 || true
+    rm -f "$CAPTURE_GEOM_FILE"
+    sleep 0.25
+    hypr_set_monitor_geometry "$name" "$mode" "$pos" "$scale" >/dev/null 2>&1 || true
+    sleep 0.5
+    ensure_extend_capture_healthy 2 force >/dev/null || true
+    emit "{\"ok\":true,\"applied\":true,\"reason\":\"placed\",\"monitor\":\"$name\",\"pos\":\"$pos\",\"mode\":\"$mode\"}"
     return 0
   fi
 
@@ -1944,10 +2073,14 @@ print("1" if v in (True,1,"1","true","yes","on") else "0")' "$(read_settings)" 2
   local parts mode pos scale rest saved_scale
   # Restore per-device Extend scale (sinkScales[MAC], else defaultExtendScale=1).
   saved_scale="$(extend_scale_get "$peer_mac")"
-  parts="$(extend_geometry_parts "$position" "$saved_scale")"
+  parts="$(extend_geometry_parts "right" "$saved_scale")"
   mode="${parts%%|*}"
   rest="${parts#*|}"
-  pos="${rest%%|*}"
+  scale="${rest#*|}"
+  [[ "$scale" == "$rest" || -z "$scale" ]] && scale="${saved_scale:-1}"
+  packed="$(pack_virtual_xy 2>/dev/null || true)"
+  pos="${packed/ /x}"
+  [[ "$pos" == *"x"* ]] || pos="0x0"
   scale="${rest#*|}"
   [[ "$scale" == "$rest" || -z "$scale" ]] && scale="${saved_scale:-1}"
   local p2p_iface=""
@@ -2534,12 +2667,14 @@ PY
   peer_mac="$(python3 -c 'import json; print(json.load(open("'"$STATUS_FILE"'")).get("peer",""))' 2>/dev/null || true)"
   position="$(extend_position)"
   saved_scale="$(extend_scale_get "$peer_mac")"
-  parts="$(extend_geometry_parts "$position" "$saved_scale")"
+  parts="$(extend_geometry_parts "right" "$saved_scale")"
   mode="${parts%%|*}"
   rest="${parts#*|}"
-  pos="${rest%%|*}"
   scale="${rest#*|}"
   [[ "$scale" == "$rest" || -z "$scale" ]] && scale="${saved_scale:-1}"
+  packed="$(pack_virtual_xy 2>/dev/null || true)"
+  pos="${packed/ /x}"
+  [[ "$pos" == *"x"* ]] || pos="0x0"
   disconnect_log "ABOUT_TO unpark USB extend $name mode=$mode pos=$pos scale=$scale (eDP modeset risk)"
   hypr_set_monitor_geometry "$name" "$mode" "$pos" "$scale" >/dev/null 2>&1 || true
   kms_settle "after USB unpark $name"
@@ -4102,15 +4237,13 @@ if profile == "best" and strategy == "smartview" and cap in ("vaapi", "dmabuf", 
         qi = 3
     if qi < 3 or qi > 4:
         qual = "3"
-    # QVBR quality-first HRD (~2 s). 0.25 s made Intel QVBR sit near minrate.
-    vbv = str(settings.get("vbvMultiplier") or "2.0").strip() or "2.0"
+    # Seconds cap; FluxCast HRD is ~4 frames inside this window.
+    vbv = str(settings.get("vbvMultiplier") or "0.1").strip() or "0.1"
     try:
         vbv_f = float(vbv)
     except ValueError:
-        vbv_f = 2.0
-    if vbv_f < 1.0:
-        vbv_f = 2.0
-    vbv = f"{max(1.0, min(4.0, vbv_f)):.1f}"
+        vbv_f = 0.1
+    vbv = f"{max(0.05, min(0.25, vbv_f)):g}"
     settings["vbvMultiplier"] = vbv
     # I-frames same quantizer as P. CQP High's 1.3 must not leak into QVBR.
     iqf = "1.0"
@@ -4616,11 +4749,15 @@ data["streamMode"] = mode_id
 data["outputRes"] = res
 data["extendResolution"] = res
 data["fps"] = str(fps)
-# Keep Extend head refresh matched to the stream mode fps (e.g. 1080p30 → 30).
-# A faster head overproduces ICC frames vs encode and causes chop / pool drops.
+# Record the stream fps. place_virtual_head clamps to advertised HEADLESS
+# modes (often only 60Hz) so we never invent a 30Hz headless mode.
 data["extendRefresh"] = int(fps)
-# 1s GOP: 1080p30 → 30, 1080p60 → 60.
-data["vaapiGop"] = 30 if fps <= 30 else 60
+# CBR interactive: ~0.25 s IDR. QVBR/CQP keep ~1 s.
+rc = str(data.get("vaapiRcMode") or "").upper()
+if rc == "CBR":
+    data["vaapiGop"] = 15
+else:
+    data["vaapiGop"] = 30 if fps <= 30 else 60
 with open(settings_path, "w", encoding="utf-8") as fh:
     json.dump(data, fh, separators=(",", ":"))
     fh.write("\n")
@@ -6302,7 +6439,7 @@ print(str(s.get("vaapiIQfactor") or "").strip())
       unset FLUXCAST_WFD_VAAPI_I_QFACTOR 2>/dev/null || true
     fi
     echo "[miracast-ctl] VAAPI RC=$FLUXCAST_WFD_VAAPI_RC bitrate=$FLUXCAST_WFD_VAAPI_BITRATE quality=$FLUXCAST_WFD_VAAPI_QUALITY async=$_async i_qfactor=${FLUXCAST_WFD_VAAPI_I_QFACTOR:-none} profile=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1]).get("encodeProfile","medium"))' "$settings" 2>/dev/null || echo medium) content=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1]).get("castPreset","desktop"))' "$settings" 2>/dev/null || echo desktop)" >>"$LOG_DIR/cast.log"
-    # QVBR: honor settings vbvMultiplier (default 2.0). CQP stays latency-first.
+    # QVBR: honor settings vbvMultiplier (default 0.25 WFD LD). CQP stays latency-first.
     _air=""
     _air="$(iw dev p2p-0 station dump 2>/dev/null | awk '/expected throughput/{gsub(/Mbps/,""); print $3; exit}')" || true
     if [[ -n "$_air" ]]; then
@@ -6314,19 +6451,24 @@ from encode_strategy import QVBR_VBV_MULTIPLIER, latency_first_vbv_multiplier, b
 s = json.loads(sys.argv[1])
 strat = normalize_strategy(s.get("encodeStrategy"))
 rc = str(s.get("vaapiRcMode") or "").strip().upper()
-if strat == "smartview" or rc == "QVBR":
+if rc == "CBR":
+    raw = str(s.get("vbvMultiplier") or "").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 0.25
+    print("%g" % max(0.2, min(0.25, v)))
+elif strat == "smartview" or rc == "QVBR":
     raw = str(s.get("vbvMultiplier") or "").strip()
     try:
         v = float(raw)
     except ValueError:
         v = QVBR_VBV_MULTIPLIER
-    if v < 1.0:
-        v = QVBR_VBV_MULTIPLIER
-    print("%g" % max(1.0, min(4.0, v)))
+    print("%g" % max(0.05, min(0.25, v)))
 else:
     enc = bitrate_to_mbps(s.get("vaapiBitrate") or s.get("bitrate") or "2.4M")
     print("%g" % latency_first_vbv_multiplier(enc, None))
-' "$settings" 2>/dev/null || echo 2.0)"
+' "$settings" 2>/dev/null || echo 0.25)"
     _vbv="${FLUXCAST_WFD_VBV_MULTIPLIER:-$_vbv}"
     export FLUXCAST_WFD_VBV_MULTIPLIER="$_vbv"
     unset FLUXCAST_WFD_VAAPI_PIPE_LOW_LATENCY 2>/dev/null || true

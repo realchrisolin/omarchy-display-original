@@ -36,21 +36,27 @@ Linux mapping:
 
 Do not reinvent a second capture graph; keep feeding the mux from that monitor.
 
-### 2. Codec choice: AAC first, LPCM when the sink forces it
+### 2. Codec choice: LPCM when the sink lists it, else AAC
 
 `WifiDisplaySource` advertises:
 
-- `AAC 00000001 00` when the sink supports AAC (default)
-- `LPCM 00000002 00` when PCM is selected
+- `AAC 00000001 00` when the sink supports AAC (AOSP **default**)
+- `LPCM 00000002 00` when PCM is selected (`media.wfd.use-pcm-audio`)
 
-Selection roughly:
+AOSP selection:
 
 1. Prefer AAC if the sink lists it
 2. Else use LPCM if the sink lists LPCM
-3. Optional property `media.wfd.use-pcm-audio` forces PCM even when AAC exists
+3. Optional `media.wfd.use-pcm-audio` forces PCM even when AAC exists
 
-FluxCast already negotiates LPCM when the TV advertises LPCM-only (and for the
-Microsoft adapter). Keep that policy; do not invent a third codec for WFD.
+FluxCast **diverges on purpose** toward (3): if the sink lists LPCM, mux WFD
+LPCM (`0x83`) even when AAC is also advertised, and even when a conservative
+P2P air check would have picked AAC. Cheap Realtek/hotyeah dongles are
+LPCM-only; sending AAC after M4 `AAC 00000001` leaves the speakers silent.
+`FLUXCAST_WFD_FORCE_AAC=1` restores AOSP’s AAC-first path.
+
+Do not invent a third codec for WFD. Do not use ffmpeg `aresample=async` on
+the AAC copy muxer (that filter held ~0.5 s of glass-to-glass).
 
 ### 3. LPCM PES payload shape (Wi-Fi Display, not Blu-ray / DVD)
 
