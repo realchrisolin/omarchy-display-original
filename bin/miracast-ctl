@@ -1257,10 +1257,210 @@ print(f"{vx} {vy}")
 PY
 }
 
+# LayoutModel.js lives beside bin/ in the repo and in the installed plugin.
+layout_model_js() {
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  printf '%s\n' "$here/../LayoutModel.js"
+}
+
+# Ask LayoutModel a yes/no or a lua snippet. Args: node script body is stdin,
+# then the virtual head name, pixel width, pixel height, scale, and for the
+# hit test a position "XxY" plus the output name to ignore.
+_layout_model_node() {
+  local js
+  js="$(layout_model_js)"
+  [[ -f "$js" ]] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+  local layout_json monitors_json
+  layout_json="$(cat "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/monitor-layout.json" 2>/dev/null || echo '{}')"
+  monitors_json="$(timeout 3 hyprctl monitors all -j 2>/dev/null || echo '[]')"
+  LAYOUT_JSON="$layout_json" MONITORS_JSON="$monitors_json" node - "$js" "$@"
+}
+
+# Position-only rules for physical monitors that are not at their packed x.
+physical_landing_lua() {
+  local vname="$1" vw="$2" vh="$3" vscale="${4:-1}"
+  _layout_model_node "$vname" "$vw" "$vh" "$vscale" <<'JS'
+const Model = require(process.argv[2])
+let layout = {}
+let monitors = []
+try { layout = JSON.parse(process.env.LAYOUT_JSON || "{}") } catch (e) { layout = {} }
+try { monitors = JSON.parse(process.env.MONITORS_JSON || "[]") } catch (e) { monitors = [] }
+const spec = {
+  name: process.argv[3],
+  width: Number(process.argv[4]) || 1920,
+  height: Number(process.argv[5]) || 1080,
+  scale: Number(process.argv[6]) || 1
+}
+process.stdout.write(Model.landingLuaForConnect(monitors, layout, spec) || "")
+JS
+}
+
+# Exit 0 when `XxY` at this mode/scale intersects a physical (or other
+# packable) monitor. The named head itself does not count.
+packed_pos_hits_physical() {
+  local pos="$1" ignore="$2" mode="$3" scale="${4:-1}"
+  local answer
+  answer="$(_layout_model_node "$pos" "$ignore" "$mode" "$scale" <<'JS'
+const Model = require(process.argv[2])
+let monitors = []
+try { monitors = JSON.parse(process.env.MONITORS_JSON || "[]") } catch (e) { monitors = [] }
+const pos = String(process.argv[3] || "0x0").split("x")
+const mode = String(process.argv[5] || "1920x1080").split("@")[0].split("x")
+const scale = Number(process.argv[6]) || 1
+const box = {
+  x: Number(pos[0]) || 0,
+  y: Number(pos[1]) || 0,
+  w: Math.round((Number(mode[0]) || 0) / scale),
+  h: Math.round((Number(mode[1]) || 0) / scale)
+}
+process.stdout.write(Model.boxHitsPackable(monitors, box, process.argv[4]) ? "yes" : "no")
+JS
+)" || return 2
+  [[ "$answer" == "yes" ]]
+}
+
+# Slide physical monitors to the packed row. allow_with_head=1 only after
+# streaming: during handshake a virtual head plus an eDP modeset locks i915.
+apply_physical_landing() {
+  local vname="$1" vw="$2" vh="$3" vscale="${4:-1}" allow_with_head="${5:-0}"
+  if [[ "$allow_with_head" != "1" ]]; then
+    if ! timeout 3 hyprctl -j monitors 2>/dev/null | python3 -c '
+import json, sys
+try:
+    ms = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+def virt(n):
+    n = str(n or "")
+    return (
+        n.startswith("HEADLESS")
+        or n == "persistent-miracast"
+        or n.startswith("persistent-miracast-")
+        or n == "Miracast"
+        or n.startswith("Miracast-")
+    )
+raise SystemExit(0 if not any(virt(m.get("name")) for m in ms) else 1)
+'; then
+      disconnect_log "skip physical landing: virtual head present or monitors unreadable"
+      return 0
+    fi
+  fi
+  local lua
+  lua="$(physical_landing_lua "$vname" "$vw" "$vh" "$vscale" 2>/dev/null || true)"
+  [[ -n "${lua//[$' \t\r\n']/}" ]] || return 0
+  disconnect_log "ABOUT_TO physical landing position-only allow_head=${allow_with_head}: ${lua//$'\n'/ | }"
+  local before="" cur=""
+  before="$(timeout 2 hyprctl monitors all -j 2>/dev/null || true)"
+  cur="$(timeout 2 hyprctl cursorpos -j 2>/dev/null || true)"
+  hyprctl eval "$lua" >/dev/null 2>&1 || true
+  follow_cursor_across_monitors "$before" "$cur"
+}
+
+# One shot per connect, after air TX is streaming. Moves eDP off the origin
+# while the head is still parked, then place-virtual-head fills that gap.
+settle_extend_layout_once() {
+  [[ -f "$STATE_DIR/layout-unstacked.stamp" ]] && return 0
+  date +%s >"$STATE_DIR/layout-unstacked.stamp"
+  local name peer_mac saved_scale parts mode rest scale wh lw lh
+  name="$(tracked_extend_name 2>/dev/null || true)"
+  [[ -n "$name" ]] || name="$SHARED_EXTEND_NAME"
+  hypr_has_monitor "$name" || return 0
+  peer_mac="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("lastPeerMac") or "")
+except Exception: print("")
+' "$SETTINGS_FILE" 2>/dev/null || true)"
+  saved_scale="$(extend_scale_get "$peer_mac")"
+  parts="$(extend_geometry_parts "right" "$saved_scale")"
+  mode="${parts%%|*}"
+  rest="${parts#*|}"
+  scale="${rest#*|}"
+  [[ "$scale" == "$rest" || -z "$scale" ]] && scale="${saved_scale:-1}"
+  wh="${mode%%@*}"
+  lw="${wh%%x*}"
+  lh="${wh#*x}"
+  disconnect_log "streaming unstack: land physical, then place $name"
+  apply_physical_landing "$name" "$lw" "$lh" "$scale" 1 || true
+  place_virtual_head >/dev/null || true
+}
+
+cursor_no_warps_get() {
+  # This Hyprland reports cursor:no_warps as {"bool": false}. An older build
+  # used "int". Reading only "int" always restored false and undid a real
+  # no_warps=true after the connect focus trip.
+  timeout 2 hyprctl getoption cursor:no_warps -j 2>/dev/null | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print("false"); raise SystemExit
+v=d.get("bool", None)
+if v is None:
+    v=d.get("int", d.get("setInt", 0))
+if isinstance(v, str):
+    v=v.strip().lower() in ("1", "true", "yes")
+elif not isinstance(v, bool):
+    try:
+        v=bool(int(v or 0))
+    except Exception:
+        v=False
+print("true" if v else "false")
+' 2>/dev/null || echo false
+}
+
+cursor_no_warps_set() {
+  timeout 2 hyprctl eval "hl.config({ cursor = { no_warps = ${1:-false} } })" >/dev/null 2>&1 || true
+}
+
+# WHICH=follow uses BEFORE_JSON, AFTER_JSON, CURSOR_JSON.
+# WHICH=rescue uses BEFORE_JSON (monitors), CURSOR_JSON, PRIMARY.
+# Prints "x y" when the pointer should move, otherwise nothing.
+_cursor_decision() {
+  local js
+  js="$(layout_model_js)"
+  [[ -f "$js" ]] || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  node - "$js" <<'JS'
+const Model = require(process.argv[2])
+function parse(name) {
+  try { return JSON.parse(process.env[name] || "null") } catch (e) { return null }
+}
+let point = null
+if (process.env.WHICH === "follow")
+  point = Model.cursorFollow(parse("BEFORE_JSON") || [], parse("AFTER_JSON") || [], parse("CURSOR_JSON") || {})
+else
+  point = Model.cursorRescue(parse("BEFORE_JSON") || [], parse("CURSOR_JSON") || {}, process.env.PRIMARY || "")
+if (point) process.stdout.write(point.x + " " + point.y)
+JS
+}
+
+_move_cursor_xy() {
+  local x="$1" y="$2" why="$3"
+  [[ "$x" =~ ^-?[0-9]+$ && "$y" =~ ^-?[0-9]+$ ]] || return 0
+  disconnect_log "cursor ${why} to ${x},${y}"
+  timeout 2 hyprctl dispatch "hl.dsp.cursor.move({ x = ${x}, y = ${y} })" >/dev/null 2>&1 || true
+}
+
+# Keep the pointer on the same pixel of a physical monitor that just moved.
+follow_cursor_across_monitors() {
+  local before="$1" cur="$2" after dest
+  [[ -n "$before" && -n "$cur" ]] || return 0
+  after="$(timeout 2 hyprctl monitors all -j 2>/dev/null || true)"
+  [[ -n "$after" ]] || return 0
+  dest="$(WHICH=follow BEFORE_JSON="$before" AFTER_JSON="$after" CURSOR_JSON="$cur" _cursor_decision || true)"
+  [[ -n "$dest" ]] || return 0
+  # shellcheck disable=SC2086
+  _move_cursor_xy $dest "followed a moved monitor"
+}
+
 hypr_set_monitor_geometry() {
   local name="$1" mode="$2" position="$3" scale="${4:-1}"
+  local before="" cur=""
+  before="$(timeout 2 hyprctl monitors all -j 2>/dev/null || true)"
+  cur="$(timeout 2 hyprctl cursorpos -j 2>/dev/null || true)"
   # Omarchy Hyprland uses the Lua config parser — keyword monitor is rejected.
   hyprctl eval "hl.monitor({ output = \"${name}\", mode = \"${mode}\", position = \"${position}\", scale = ${scale} })" >/dev/null
+  follow_cursor_across_monitors "$before" "$cur"
 }
 
 fluxcast_pid() {
@@ -1870,6 +2070,48 @@ except Exception: print("")
     packed="$(pack_virtual_xy 2>/dev/null || true)"
     pos="${packed/ /x}"
     [[ "$pos" == *"x"* ]] || pos="0x0"
+    local hit_rc=0
+    if packed_pos_hits_physical "$pos" "$name" "$mode" "$scale"; then
+      hit_rc=0
+    else
+      hit_rc=$?
+    fi
+    # 0 = intersects, 2 = check failed. Only a clean "no" (1) may place.
+    # A real intersection means some other writer put the laptop on the TV's
+    # box and then stopped. Leaving it there is the lock-screen warning burst.
+    # Slide the physical monitors once, the same post-TX landing, then recheck.
+    # A failed check (2) must not move anything. The stamp stops a layout
+    # settle that re-stacks the laptop from modesetting eDP in a loop.
+    if [[ "$hit_rc" -eq 0 ]]; then
+      local boxes="" now="" last="" vw="" vh=""
+      boxes="$(timeout 2 hyprctl monitors all -j 2>/dev/null | jq -c '[.[] | {name,x,y,w:.width,h:.height,disabled,dpms:.dpmsStatus,focused}]' 2>/dev/null || true)"
+      now="$(date +%s)"
+      last=0
+      [[ -f "$STATE_DIR/overlap-land.stamp" ]] && last="$(cat "$STATE_DIR/overlap-land.stamp" 2>/dev/null || echo 0)"
+      [[ "$last" =~ ^[0-9]+$ ]] || last=0
+      if (( now - last < 5 )); then
+        disconnect_log "place-virtual-head overlap $name at $pos boxes=${boxes:-?} landing skipped (cooldown)"
+      else
+        printf '%s\n' "$now" >"$STATE_DIR/overlap-land.stamp" 2>/dev/null || true
+        vw="${mode%%x*}"
+        vh="${mode#*x}"
+        vh="${vh%%@*}"
+        [[ "$vw" =~ ^[0-9]+$ ]] || vw=1920
+        [[ "$vh" =~ ^[0-9]+$ ]] || vh=1080
+        disconnect_log "place-virtual-head overlap $name at $pos boxes=${boxes:-?}, landing physical monitors"
+        apply_physical_landing "$name" "$vw" "$vh" "$scale" 1
+        if packed_pos_hits_physical "$pos" "$name" "$mode" "$scale"; then
+          hit_rc=0
+        else
+          hit_rc=$?
+        fi
+      fi
+    fi
+    if [[ "$hit_rc" -ne 1 ]]; then
+      disconnect_log "place-virtual-head refused $name at $pos (hit_rc=$hit_rc)"
+      emit "{\"ok\":true,\"applied\":false,\"reason\":\"blocked-overlap\",\"monitor\":\"$name\",\"pos\":\"$pos\",\"mode\":\"$mode\"}"
+      return 0
+    fi
     local place_kind=""
     place_kind="$(python3 - "$name" "$pos" "$mode" <<'PY'
 import json, re, subprocess, sys
@@ -1900,6 +2142,7 @@ PY
     place_kind="${place_kind//$'\n'/}"
     place_kind="${place_kind:-mode}"
     if [[ "$place_kind" == "already" ]]; then
+      rm -f "$PARKED_FILE"
       emit "{\"ok\":true,\"applied\":false,\"reason\":\"already-placed\",\"monitor\":\"$name\",\"pos\":\"$pos\",\"mode\":\"$mode\"}"
       return 0
     fi
@@ -1907,6 +2150,7 @@ PY
     # moves must not SIGUSR1 capture (that rebuilt AAC+aresample and lag).
     if [[ "$place_kind" == "xy" ]]; then
       hypr_set_monitor_geometry "$name" "$mode" "$pos" "$scale" >/dev/null 2>&1 || true
+      rm -f "$PARKED_FILE"
       emit "{\"ok\":true,\"applied\":true,\"reason\":\"moved\",\"monitor\":\"$name\",\"pos\":\"$pos\",\"mode\":\"$mode\"}"
       return 0
     fi
@@ -1917,6 +2161,7 @@ PY
     hypr_set_monitor_geometry "$name" "$mode" "$pos" "$scale" >/dev/null 2>&1 || true
     sleep 0.5
     ensure_extend_capture_healthy 2 force >/dev/null || true
+    rm -f "$PARKED_FILE"
     emit "{\"ok\":true,\"applied\":true,\"reason\":\"placed\",\"monitor\":\"$name\",\"pos\":\"$pos\",\"mode\":\"$mode\"}"
     return 0
   fi
@@ -1936,6 +2181,8 @@ cmd_place_virtual_head() {
 
 ensure_extend_monitor() {
   # Create/reuse a Hyprland headless for Extend, placed relative to primary.
+  # Each connect may unstack once, after streaming. Clear any previous stamp.
+  rm -f "$STATE_DIR/layout-unstacked.stamp"
   # Args: [peer_name] [peer_mac]
   # preserveDisplayAcrossMonitors on → shared name persistent-miracast.
   # preserve off → peer-sanitized name (fresh per-sink desktop).
@@ -2035,6 +2282,17 @@ print("1" if v in (True,1,"1","true","yes","on") else "0")' "$(read_settings)" 2
   fi
 
   if [[ -z "$headless" ]]; then
+    # A new headless output appears at 0x0. Move physical monitors off that
+    # origin first, while no virtual head exists. Doing it after create stacks
+    # the head on eDP and Hyprland warns that the layout overlaps.
+    local pre_scale pre_parts pre_mode pre_wh pre_w pre_h
+    pre_scale="$(extend_scale_get "$peer_mac")"
+    pre_parts="$(extend_geometry_parts "right" "$pre_scale")"
+    pre_mode="${pre_parts%%|*}"
+    pre_wh="${pre_mode%%@*}"
+    pre_w="${pre_wh%%x*}"
+    pre_h="${pre_wh#*x}"
+    apply_physical_landing "$desired" "$pre_w" "$pre_h" "$pre_scale" 0 || true
     headless="$(unique_extend_output_name "$desired" "")"
     if [[ -z "$headless" ]]; then
       echo ""
@@ -2095,7 +2353,8 @@ print("1" if v in (True,1,"1","true","yes","on") else "0")' "$(read_settings)" 2
   if is_usb_wifi_iface "$p2p_iface"; then
     # USB GO Neg takes seconds and never completed in our tests. Placing the
     # head beside eDP modesets the laptop panel (CCS corruption / i915 lock).
-    # Park until a real group exists; AX201 (fast Neg) still uses on-layout.
+    # Park until a real group exists; AX201 (fast Neg) still uses on-layout
+    # only when that box does not intersect a physical monitor.
     hypr_set_monitor_geometry "$headless" "1920x1080@30" "$PARKED_EXTEND_POS" "1" >/dev/null 2>&1 || true
     printf '%s\n' "$headless" >"$PARKED_FILE"
     kms_settle "USB P2P: parked $headless at $PARKED_EXTEND_POS (no eDP modeset)"
@@ -2104,8 +2363,29 @@ print("1" if v in (True,1,"1","true","yes","on") else "0")' "$(read_settings)" 2
     echo "$headless"
     return 0
   fi
-  hypr_set_monitor_geometry "$headless" "$mode" "$pos" "$scale" >/dev/null 2>&1 || true
-  kms_settle "after geometry $headless $mode $pos scale=$scale"
+  local hit_rc=0
+  if packed_pos_hits_physical "$pos" "$headless" "$mode" "$scale"; then
+    hit_rc=0
+  else
+    hit_rc=$?
+  fi
+  if [[ "$hit_rc" -ne 1 ]]; then
+    # Packed origin is still occupied (eDP at 0x0, head first in the order),
+    # or the check could not run. Placing here is the overlap warning. Stay
+    # parked; streaming unstack moves eDP, then place-virtual-head fills the gap.
+    disconnect_log "connect-time not placing $headless at $pos (hit_rc=$hit_rc); parking"
+    if ! extend_head_is_parked "$headless"; then
+      hypr_set_monitor_geometry "$headless" "$mode" "$PARKED_EXTEND_POS" "$scale" >/dev/null 2>&1 || true
+      kms_settle "parked $headless at $PARKED_EXTEND_POS (packed $pos overlapped)"
+    else
+      disconnect_log "connect-time $headless already parked; not placing at $pos"
+    fi
+    printf '%s\n' "$headless" >"$PARKED_FILE"
+  else
+    hypr_set_monitor_geometry "$headless" "$mode" "$pos" "$scale" >/dev/null 2>&1 || true
+    kms_settle "after geometry $headless $mode $pos scale=$scale"
+    rm -f "$PARKED_FILE"
+  fi
   # Park empty legacy head far away so it does not stack on the same origin
   # as persistent-miracast (same x/y hides the cast desktop under an empty head).
   if [[ "$preserve" == "1" && -n "$legacy" && "$legacy" != "$headless" ]]; then
@@ -2245,9 +2525,13 @@ for m in ms:
 # occupied workspace on that monitor. New heads often activate an empty numeric
 # WS so the TV looks blank while windows still sit on inactive ext-*.
 focus_occupied_extend_workspace() {
-  local mon="${1:-}" preferred="${2:-}" primary=""
+  local mon="${1:-}" preferred="${2:-}" primary="" warps=""
   [[ -n "$mon" ]] || return 0
   primary="$(primary_monitor_name)"
+  # Focusing the cast head changes workspace onto another monitor, and Hyprland
+  # warps the pointer to that monitor's middle (and back, via warp_on_change_workspace).
+  warps="$(cursor_no_warps_get)"
+  cursor_no_warps_set true
   python3 - "$mon" "$primary" "$preferred" <<'PY' 2>/dev/null || true
 import json, subprocess, sys
 mon, primary, preferred = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -2299,6 +2583,7 @@ if primary and primary != mon:
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=3,
     )
 PY
+  cursor_no_warps_set "$warps"
 }
 
 # Bidirectional pin: ext-* on cast head, numeric/other on the laptop.
@@ -2371,14 +2656,16 @@ for m in ms:
 print("1")
 ' "$primary" 2>/dev/null || echo 1)"
 
-  # warp_on_change_workspace would send the pointer to ext-1; suppress that
-  # while activating the TV desktop, then force the seat back to eDP.
-  timeout 2 hyprctl eval 'hl.config({ cursor = { no_warps = true } })' >/dev/null 2>&1 || true
+  # warp_on_change_workspace would send the pointer to ext-1. Keep warps
+  # off for the trip onto the TV desktop and the return to the laptop.
+  local warps=""
+  warps="$(cursor_no_warps_get)"
+  cursor_no_warps_set true
   hyprctl dispatch "hl.dsp.focus({ monitor = \"${cast}\" })" >/dev/null 2>&1 || true
   hyprctl dispatch "hl.dsp.focus({ workspace = \"name:ext-1\", on_current_monitor = true })" >/dev/null 2>&1 || true
-  timeout 2 hyprctl eval 'hl.config({ cursor = { no_warps = false } })' >/dev/null 2>&1 || true
   hyprctl dispatch "hl.dsp.focus({ monitor = \"${primary}\" })" >/dev/null 2>&1 || true
   hyprctl dispatch "hl.dsp.focus({ workspace = \"${prev_ws}\" })" >/dev/null 2>&1 || true
+  cursor_no_warps_set "$warps"
   force_seat_to_primary || true
   return 0
 }
@@ -2682,6 +2969,16 @@ PY
   packed="$(pack_virtual_xy 2>/dev/null || true)"
   pos="${packed/ /x}"
   [[ "$pos" == *"x"* ]] || pos="0x0"
+  local unpark_hit=0
+  if packed_pos_hits_physical "$pos" "$name" "$mode" "$scale"; then
+    unpark_hit=0
+  else
+    unpark_hit=$?
+  fi
+  if [[ "$unpark_hit" -ne 1 ]]; then
+    disconnect_log "unpark skipped for $name at $pos (hit_rc=$unpark_hit); leave parked until physical monitors move"
+    return 0
+  fi
   disconnect_log "ABOUT_TO unpark USB extend $name mode=$mode pos=$pos scale=$scale (eDP modeset risk)"
   hypr_set_monitor_geometry "$name" "$mode" "$pos" "$scale" >/dev/null 2>&1 || true
   kms_settle "after USB unpark $name"
@@ -2731,45 +3028,28 @@ print("1920x1080@30 1")
   disconnect_log "parked extend head name=$name at $PARKED_EXTEND_POS (mode=$mode scale=$scale)"
 }
 
-# Force keyboard/pointer seat onto the laptop panel (eDP).
-# Hyprland 0.56 dispatchers are lua (`hl.dsp.*`). The old `focusmonitor` /
-# `movecursor X Y` forms are parse errors and left the seat on Extend.
+# Keyboard focus back to the laptop. The pointer moves only when it is not
+# already on a physical monitor (stranded on the Extend head, or in the gap
+# a parked head left behind). That landing keeps the relative spot, not the
+# center of the panel. Hyprland 0.56 dispatchers are lua (`hl.dsp.*`).
 force_seat_to_primary() {
-  local primary=""
+  local primary="" warps="" monitors="" cur="" dest=""
   primary="$(primary_monitor_name)"
   [[ -n "$primary" ]] || return 0
+  warps="$(cursor_no_warps_get)"
+  cursor_no_warps_set true
   hypr_try dispatch "hl.dsp.release_input_capture()"
   hypr_try dispatch "hl.dsp.focus({ monitor = \"${primary}\" })"
-  python3 - "$primary" <<'PY' 2>/dev/null || true
-import json, subprocess, sys
-want = sys.argv[1]
-try:
-    ms = json.loads(subprocess.check_output(
-        ["timeout", "2", "hyprctl", "-j", "monitors"], text=True, timeout=3
-    ))
-except Exception:
-    raise SystemExit
-for m in ms:
-    if str(m.get("name") or "") != want:
-        continue
-    x = int(m.get("x") or 0)
-    y = int(m.get("y") or 0)
-    w = int(m.get("width") or 1920)
-    h = int(m.get("height") or 1080)
-    scale = float(m.get("scale") or 1) or 1.0
-    lw = max(int(round(w / scale)), 1)
-    lh = max(int(round(h / scale)), 1)
-    cx = x + lw // 2
-    cy = y + lh // 2
-    subprocess.run(
-        ["timeout", "2", "hyprctl", "dispatch",
-         f"hl.dsp.cursor.move({{ x = {cx}, y = {cy} }})"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-        timeout=3,
-    )
-    raise SystemExit
-PY
-  hypr_try dispatch "hl.dsp.focus({ monitor = \"${primary}\" })"
+  monitors="$(timeout 2 hyprctl monitors all -j 2>/dev/null || true)"
+  cur="$(timeout 2 hyprctl cursorpos -j 2>/dev/null || true)"
+  if [[ -n "$monitors" && -n "$cur" ]]; then
+    dest="$(WHICH=rescue BEFORE_JSON="$monitors" CURSOR_JSON="$cur" PRIMARY="$primary" _cursor_decision || true)"
+    if [[ -n "$dest" ]]; then
+      # shellcheck disable=SC2086
+      _move_cursor_xy $dest "rescued onto ${primary}"
+    fi
+  fi
+  cursor_no_warps_set "$warps"
 }
 
 cleanup_extend_monitor() {
@@ -6699,6 +6979,9 @@ PY
           air_lost_since=0
           echo "$(date -Iseconds) [miracast-ctl] air TX proven — UI → streaming" >>"$LOG_DIR/cast.log"
           activate_miracast_audio_default || true
+          # Head was parked when its packed box sat on eDP. Move eDP first,
+          # then place. Once per connect (stamp), not on every TX flap.
+          settle_extend_layout_once || true
         fi
       elif [[ "$saw_play" -eq 0 ]]; then
         # Live P2P only — never promote dhcp from historical cast.log lines

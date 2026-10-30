@@ -104,6 +104,8 @@ QtObject {
         var anyChanged = positions.some(function(p) {
           return p.changed && !LayoutModel.isVirtualHead({ name: p.name })
         })
+        if (!anyChanged && LayoutModel.packableOverlap(monitors))
+          anyChanged = true
         if (!anyChanged) {
           root._persistReloadLua(monitors, layout)
           root._finish()

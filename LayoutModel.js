@@ -909,18 +909,186 @@ function positionsToLua(positions, staging, parked) {
     for (var i = 0; i < phys.length; i++)
       lines.push(positionRule(phys[i].name, staging + phys[i].x, phys[i].y))
   }
-  // Move the Miracast head while physical outputs are still staged, so eDP
-  // never lands on the TV's old x (Hyprland "monitor layout overlaps").
-  for (var v = 0; v < virt.length; v++)
-    lines.push(positionRule(virt[v].name, virt[v].x, virt[v].y))
   for (var j = 0; j < phys.length; j++)
     lines.push(positionRule(phys[j].name, phys[j].x, phys[j].y))
   for (var k = 0; k < (parked || []).length; k++)
     lines.push("hl.monitor({ output = " + luaString(parked[k]) + ", position = \"auto-right\" })")
+  // After every physical rule. A rejected HEADLESS rule aborts the rest of
+  // the eval; placed earlier, that abort left eDP stacked at 0x0 (lock-screen
+  // overlap, cursor on both). place-virtual-head repeats the move on its own
+  // when this rule does not apply.
+  for (var v = 0; v < virt.length; v++) {
+    if (virt[v].changed)
+      lines.push(positionRule(virt[v].name, virt[v].x, virt[v].y))
+  }
   return lines.join("\n")
 }
 
-// Outputs from `known` that are not placed by `positions`, i.e. unplugged.
+// True when two packable outputs share compositor space (cursor on both,
+// Hyprland "monitor layout overlaps"). Lock reload of monitors.lua (eDP 0x0)
+// while persistent-miracast is also at 0x0 is the usual case.
+function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+  return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+}
+
+function packableOverlap(monitors) {
+  var list = (monitors || []).filter(isPackable)
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i]
+    var asz = logicalSize(a)
+    for (var j = i + 1; j < list.length; j++) {
+      var b = list[j]
+      var bsz = logicalSize(b)
+      if (rectsOverlap(Number(a.x) || 0, Number(a.y) || 0, asz.w, asz.h, Number(b.x) || 0, Number(b.y) || 0, bsz.w, bsz.h))
+        return true
+    }
+  }
+  return false
+}
+
+// True when `box` shares area with a packable output other than `ignoreName`.
+// Touching edges do not count. Used so place-virtual-head will not land the
+// Extend head on eDP (Hyprland's overlap warning, cursor on both outputs).
+function boxHitsPackable(monitors, box, ignoreName) {
+  var x = Number(box && box.x) || 0
+  var y = Number(box && box.y) || 0
+  var w = Number(box && box.w) || 0
+  var h = Number(box && box.h) || 0
+  if (w <= 0 || h <= 0) return false
+  var list = (monitors || []).filter(isPackable)
+  for (var i = 0; i < list.length; i++) {
+    if (ignoreName && String(list[i].name) === String(ignoreName)) continue
+    var b = list[i]
+    var bsz = logicalSize(b)
+    if (rectsOverlap(x, y, w, h, Number(b.x) || 0, Number(b.y) || 0, bsz.w, bsz.h))
+      return true
+  }
+  return false
+}
+
+// Position-only rules that move physical monitors to the packed row.
+// The virtual head is omitted: miracast-ctl places it after this eval.
+// When the head is not connected yet, `virtualHead` is inserted as a
+// placeholder so eDP slides off the origin the new headless output occupies.
+// Empty when every physical monitor is already there.
+function landingLuaForConnect(monitors, layout, virtualHead) {
+  var list = (monitors || []).slice()
+  var spec = virtualHead || {}
+  var vname = String(spec.name || "persistent-miracast")
+  var have = false
+  for (var i = 0; i < list.length; i++) {
+    if (String(list[i].name) === vname) { have = true; break }
+  }
+  if (!have) {
+    list.push({
+      name: vname,
+      description: vname,
+      width: Number(spec.width) > 0 ? Number(spec.width) : 1920,
+      height: Number(spec.height) > 0 ? Number(spec.height) : 1080,
+      scale: Number(spec.scale) > 0 ? Number(spec.scale) : 1,
+      transform: 0,
+      x: -12000,
+      y: 0,
+      disabled: false,
+      dpmsStatus: true,
+      focused: false,
+      mirrorOf: "none",
+      miracast: true
+    })
+  }
+  var positions = computePositions(
+    list,
+    (layout && layout.order) || [],
+    (layout && layout.stack) || {},
+    (layout && layout.monitors) || {}
+  )
+  var lines = []
+  for (var p = 0; p < positions.length; p++) {
+    if (isVirtualHead({ name: positions[p].name })) continue
+    if (!positions[p].changed) continue
+    lines.push(positionRule(positions[p].name, positions[p].x, positions[p].y))
+  }
+  return lines.join("\n")
+}
+
+function logicalBox(monitor) {
+  var size = logicalSize(monitor)
+  return {
+    x: Number(monitor && monitor.x) || 0,
+    y: Number(monitor && monitor.y) || 0,
+    w: size.w,
+    h: size.h
+  }
+}
+
+function pointInBox(box, x, y) {
+  return x >= box.x && y >= box.y && x < box.x + box.w && y < box.y + box.h
+}
+
+// null when the pointer is already on a physical monitor: do not teleport it.
+// Otherwise land it on `primaryName` at the same relative spot it had on the
+// virtual head, or at the nearest point of the laptop if it is in empty space.
+// Never the center. A reconnect that always warps to center is the jump.
+function cursorRescue(monitors, cursor, primaryName) {
+  var x = Number(cursor && cursor.x) || 0
+  var y = Number(cursor && cursor.y) || 0
+  var list = monitors || []
+  var primary = null
+  var onPhysical = false
+  var virtualHit = null
+  for (var i = 0; i < list.length; i++) {
+    var box = logicalBox(list[i])
+    if (box.w <= 0 || box.h <= 0) continue
+    if (String(list[i].name) === String(primaryName)) primary = box
+    if (!pointInBox(box, x, y)) continue
+    if (isVirtualHead(list[i])) {
+      if (!virtualHit) virtualHit = box
+    } else {
+      onPhysical = true
+    }
+  }
+  if (onPhysical || !primary) return null
+  var dx = x - (virtualHit ? virtualHit.x : primary.x)
+  var dy = y - (virtualHit ? virtualHit.y : primary.y)
+  if (virtualHit && virtualHit.w > 0) dx = dx * primary.w / virtualHit.w
+  if (virtualHit && virtualHit.h > 0) dy = dy * primary.h / virtualHit.h
+  dx = Math.max(0, Math.min(primary.w - 1, Math.round(dx)))
+  dy = Math.max(0, Math.min(primary.h - 1, Math.round(dy)))
+  var nx = primary.x + dx
+  var ny = primary.y + dy
+  if (nx === x && ny === y) return null
+  return { x: nx, y: ny }
+}
+
+// After a monitor moves, keep a pointer that was on a physical output on that
+// same pixel. Virtual heads are ignored so parking one cannot drag the cursor
+// to -12000.
+function cursorFollow(before, after, cursor) {
+  var x = Number(cursor && cursor.x) || 0
+  var y = Number(cursor && cursor.y) || 0
+  var host = null
+  var list = before || []
+  for (var i = 0; i < list.length; i++) {
+    if (isVirtualHead(list[i])) continue
+    var box = logicalBox(list[i])
+    if (box.w <= 0 || box.h <= 0) continue
+    if (pointInBox(box, x, y)) { host = list[i]; break }
+  }
+  if (!host) return null
+  var now = null
+  var next = after || []
+  for (var j = 0; j < next.length; j++) {
+    if (String(next[j].name) === String(host.name)) { now = next[j]; break }
+  }
+  if (!now) return null
+  var oldBox = logicalBox(host)
+  var newBox = logicalBox(now)
+  var nx = newBox.x + (x - oldBox.x)
+  var ny = newBox.y + (y - oldBox.y)
+  if (nx === x && ny === y) return null
+  return { x: nx, y: ny }
+}
+
 function parkedOutputs(known, positions) {
   var placed = {}
   for (var i = 0; i < positions.length; i++) placed[positions[i].name] = true
@@ -1125,6 +1293,11 @@ if (typeof module !== "undefined") {
     dropTarget: dropTarget,
     stagingX: stagingX,
     positionsToLua: positionsToLua,
+    packableOverlap: packableOverlap,
+    boxHitsPackable: boxHitsPackable,
+    landingLuaForConnect: landingLuaForConnect,
+    cursorRescue: cursorRescue,
+    cursorFollow: cursorFollow,
     parkedOutputs: parkedOutputs,
     moveItem: moveItem,
     dropIndex: dropIndex,

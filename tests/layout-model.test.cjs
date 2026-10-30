@@ -243,26 +243,91 @@ test("positionsToLua stages monitors before moving them into place", () => {
   ])
 })
 
-test("swapping Miracast left of eDP never overlaps during staged eval", () => {
-  const overlaps = (rects) => rects.some((a, i) => rects.some((b, j) =>
-    i < j && a.x < b.x + b.w && b.x < a.x + a.w))
+test("positionsToLua omits an already-placed Miracast head so eDP can unstack", () => {
+  const edp = { name: "eDP-1", description: "Chimei", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, disabled: false, mirrorOf: "none" }
+  const tv = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, miracast: true }
+  const positions = Model.computePositions([edp, tv], ["persistent-miracast", "Chimei"])
+  const lua = Model.positionsToLua(positions, Model.stagingX([edp, tv], positions))
+  assert.equal(/persistent-miracast/.test(lua), false)
+  assert.match(lua, /eDP-1/)
+  assert.ok(Model.packableOverlap([edp, tv]))
+})
+
+test("connect lands eDP off the origin before a new Miracast head is created", () => {
+  const edp = {
+    name: "eDP-1",
+    description: "Chimei Innolux Corporation 0x14E7",
+    width: 1920, height: 1080, scale: 1, transform: 0,
+    x: 0, y: 0, disabled: true, dpmsStatus: true, focused: true, mirrorOf: "none"
+  }
+  const layout = {
+    order: ["persistent-miracast", "Chimei Innolux Corporation 0x14E7"],
+    monitors: {},
+    stack: {}
+  }
+  const lua = Model.landingLuaForConnect([edp], layout, {
+    name: "persistent-miracast", width: 1920, height: 1080, scale: 1
+  })
+  assert.equal(lua, 'hl.monitor({ output = "eDP-1", position = "1920x0" })')
+  assert.equal(Model.boxHitsPackable([edp], { x: 0, y: 0, w: 1920, h: 1080 }, "persistent-miracast"), true)
+})
+
+test("a head already at 0x0 does not count as hitting itself once eDP has moved", () => {
+  const edp = {
+    name: "eDP-1", description: "Chimei Innolux Corporation 0x14E7",
+    width: 1920, height: 1080, scale: 1, transform: 0,
+    x: 1920, y: 0, disabled: true, dpmsStatus: true, focused: true, mirrorOf: "none"
+  }
+  const tv = {
+    name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0,
+    x: 0, y: 0, disabled: true, dpmsStatus: true, focused: false, mirrorOf: "none", miracast: true
+  }
+  const layout = { order: ["persistent-miracast", edp.description], monitors: {}, stack: {} }
+  assert.equal(Model.landingLuaForConnect([edp, tv], layout, { name: tv.name, width: 1920, height: 1080, scale: 1 }), "")
+  assert.equal(Model.boxHitsPackable([edp, tv], { x: 0, y: 0, w: 1920, h: 1080 }, tv.name), false)
+  assert.equal(Model.boxHitsPackable([{ ...edp, x: 0 }, tv], { x: 0, y: 0, w: 1920, h: 1080 }, tv.name), true)
+})
+
+test("a reconnect does not teleport a cursor that is already on the laptop", () => {
+  const edp = { name: "eDP-1", x: 1920, y: 0, width: 1920, height: 1080, scale: 1, transform: 0 }
+  const tv = { name: "persistent-miracast", x: 0, y: 0, width: 1920, height: 1080, scale: 1, transform: 0, miracast: true }
+  assert.equal(Model.cursorRescue([edp, tv], { x: 2709, y: 481 }, "eDP-1"), null)
+  assert.equal(Model.cursorRescue(
+    [{ ...edp, x: 0, disabled: true, dpmsStatus: true, focused: true }, { ...tv, x: 0, disabled: true, dpmsStatus: true }],
+    { x: 800, y: 400 },
+    "eDP-1"
+  ), null)
+})
+
+test("a cursor on the Miracast head returns to the same spot on the laptop", () => {
+  const edp = { name: "eDP-1", x: 1920, y: 0, width: 1920, height: 1080, scale: 1, transform: 0 }
+  const tv = { name: "persistent-miracast", x: 0, y: 0, width: 1920, height: 1080, scale: 1, transform: 0, miracast: true }
+  assert.deepEqual(Model.cursorRescue([edp, tv], { x: 400, y: 200 }, "eDP-1"), { x: 2320, y: 200 })
+})
+
+test("sliding eDP keeps the cursor on the same laptop pixel", () => {
+  const edp = { name: "eDP-1", width: 1920, height: 1080, scale: 1, transform: 0 }
+  const tv = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, miracast: true }
+  assert.deepEqual(
+    Model.cursorFollow([{ ...edp, x: 0, y: 0 }, { ...tv, x: 0, y: 0 }], [{ ...edp, x: 1920, y: 0 }, { ...tv, x: 0, y: 0 }], { x: 800, y: 400 }),
+    { x: 2720, y: 400 }
+  )
+  assert.equal(
+    Model.cursorFollow([{ ...edp, x: 1920, y: 0 }, { ...tv, x: 0, y: 0 }], [{ ...edp, x: 1920, y: 0 }, { ...tv, x: -12000, y: 0 }], { x: 2500, y: 100 }),
+    null
+  )
+})
+
+test("a Miracast move comes after eDP has landed, so a rejected head cannot abort it", () => {
   const edp = { name: "eDP-1", description: "Chimei", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, disabled: false, mirrorOf: "none" }
   const tv = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, y: 0, miracast: true }
-  const order = ["persistent-miracast", "Chimei"]
-  const positions = Model.computePositions([edp, tv], order)
-  const staging = Model.stagingX([edp, tv], positions)
-  const state = {
-    "eDP-1": { x: 0, w: 1920 },
-    "persistent-miracast": { x: 1920, w: 1920 }
-  }
-  const lua = Model.positionsToLua(positions, staging)
-  assert.match(lua, /persistent-miracast/)
-  for (const line of lua.split("\n")) {
-    const m = line.match(/output = "([^"]+)", position = "(-?\d+)x/)
-    if (!m) continue
-    state[m[1]].x = Number(m[2])
-    assert.equal(overlaps(Object.values(state)), false, line + " -> " + JSON.stringify(state))
-  }
+  const positions = Model.computePositions([edp, tv], ["persistent-miracast", "Chimei"])
+  const lines = Model.positionsToLua(positions, Model.stagingX([edp, tv], positions)).split("\n")
+  const edpFinal = lines.findLastIndex(line => line.includes('"eDP-1"') && line.includes('"1920x0"'))
+  const tvLine = lines.findIndex(line => line.includes("persistent-miracast"))
+  assert.ok(edpFinal >= 0)
+  assert.ok(tvLine > edpFinal)
+  assert.ok(positions.some(p => p.name === "persistent-miracast" && p.changed))
 })
 
 test("staged moves never overlap, whichever way the monitors swap", () => {

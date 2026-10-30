@@ -255,7 +255,7 @@ interactive latency, and AOSP `Converter.cpp` (**CBR**, ~1 s IDR).
 | HEADLESS Hz | Match negotiated fps; clamp to advertised modes (**60** typical) | 30 Hz on a 60 Hz-only head stalls ICC. |
 | DMA freeze recovery | `encode stall` stderr (~4 s) + LPCM `wchar` IO watchdog (~8 s) | ICC DMA can stall after a window move; rchar stays flat so the watchdog watches wchar. |
 
-Layout: packer includes the Miracast tile. `positionsToLua` stages physical outputs **past** the virtual head, then moves `persistent-miracast`, then lands eDP — otherwise Hyprland warns **monitor layout overlaps**. `place-virtual-head` on **x,y-only** does not SIGUSR1 capture (`wf-recorder -o` follows the output name). Do not `miracast-ctl stop`/`start` to tweak encode (that modesets the virtual head; on kenya it has corrupted eDP). Use `restart-capture` or a user-requested reconnect.
+Layout: packer includes the Miracast tile. Connect slides physical monitors off the packed origin before creating the head, and will not place `persistent-miracast` on top of eDP — that is Hyprland's **monitor layout overlaps** warning (cursor on both outputs). `place-virtual-head` on **x,y-only** does not SIGUSR1 capture (`wf-recorder -o` follows the output name). Do not `miracast-ctl stop`/`start` to tweak encode (that modesets the virtual head; on kenya it has corrupted eDP). Use `restart-capture` or a user-requested reconnect.
 
 ### PRESET QUALITY
 

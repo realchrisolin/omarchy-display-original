@@ -700,6 +700,15 @@ Item {
     else startCast(lastPeerMac)
   }
 
+  function nudgeLayout() {
+    // Touch a stamp so MonitorLayoutHost re-applies physical packing after
+    // lock/unlock (hyprlock reload of monitors.lua stacks eDP on the TV).
+    Qt.callLater(function() {
+      layoutNudgeProc.command = ["bash", "-c", "mkdir -p \"$HOME/.local/state/omarchy-miracast\" && date +%s > \"$HOME/.local/state/omarchy-miracast/layout.nudge\""]
+      layoutNudgeProc.running = true
+    })
+  }
+
   function pauseCaptureForLock() {
     if (!streaming && !running) return
     if (pauseLockProcess.running) return
@@ -755,9 +764,14 @@ Item {
       var locked = exitCode === 0
       if (locked === root._sessionLocked) return
       root._sessionLocked = locked
+      root.nudgeLayout()
       if (locked) root.pauseCaptureForLock()
       else root.resumeCaptureAfterLock()
     }
+  }
+
+  Process {
+    id: layoutNudgeProc
   }
 
   Process {

@@ -30,6 +30,7 @@ Item {
   readonly property string orderPath: Quickshell.env("HOME") + "/.config/omarchy/monitor-layout.json"
   readonly property string statusPath: Quickshell.env("HOME") + "/.local/state/omarchy-miracast/status.json"
   readonly property string lockPath: Quickshell.env("HOME") + "/.local/state/omarchy-miracast/connecting.lock"
+  readonly property string layoutNudgePath: Quickshell.env("HOME") + "/.local/state/omarchy-miracast/layout.nudge"
   readonly property string pluginDir: {
     var s = String(Qt.resolvedUrl("./"))
     if (s.indexOf("file://") === 0)
@@ -102,7 +103,12 @@ Item {
     path: root.statusPath
     watchChanges: true
     printErrors: false
-    onFileChanged: reload()
+    onFileChanged: {
+      reload()
+      // Handshake hold ends when phase becomes streaming. Without this, a
+      // connect that parked the head never comes back to move eDP.
+      settle.restart()
+    }
   }
 
   FileView {
@@ -111,6 +117,13 @@ Item {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
+  }
+
+  FileView {
+    path: root.layoutNudgePath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: settle.restart()
   }
 
   Process {
