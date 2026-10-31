@@ -109,8 +109,25 @@ Column {
   function moveGrabbedVertically(dy) {
     if (grabbedIndex < 0) return
     var tile = tiles[grabbedIndex]
-    if (tile.virtual) return
     var side = dy < 0 ? "above" : "below"
+    if (tile.virtual) {
+      var entryV = LayoutModel.activeStack(monitors, orderFile.layout.stack)[tile.key]
+      if (entryV) {
+        if (entryV.side !== side) {
+          var rowV = rowKeys()
+          saveLayout(LayoutModel.withRowPosition(orderFile.layout, tile.key, rowV,
+            rowV.indexOf(baseKey(tile.key)) + 1))
+        }
+        return
+      }
+      var edp = null
+      for (var v = 0; v < tiles.length; v++) {
+        if (tiles[v].internal) { edp = tiles[v]; break }
+      }
+      if (!edp) return
+      saveLayout(LayoutModel.withVirtualStacked(orderFile.layout, tile.key, edp.key, side))
+      return
+    }
     var entry = LayoutModel.activeStack(monitors, orderFile.layout.stack)[tile.key]
     if (entry) {
       // Moving back towards the monitor it stands on returns it to the row.
@@ -148,10 +165,6 @@ Column {
   function activate() {
     if (!available) return
     if (!reorderable) {
-      showProperties()
-      return
-    }
-    if (tiles[selectedIndex].virtual) {
       showProperties()
       return
     }
@@ -217,22 +230,20 @@ Column {
   function dropTile(from, target, dx) {
     if (!tiles[from]) return
     if (tiles[from].virtual) {
-      // Row only — pack_virtual_xy does not honor stack.
-      if (target.side === "row")
-        saveLayout(LayoutModel.withRowPosition(orderFile.layout, tiles[from].key, rowKeys(), target.index))
-      else {
-        var keys = rowKeys()
-        var onIdx = keys.indexOf(target.on)
-        var idx = onIdx < 0 ? keys.length : onIdx
-        saveLayout(LayoutModel.withRowPosition(orderFile.layout, tiles[from].key, keys, idx))
-      }
+      saveLayout(LayoutModel.applyVirtualDrop(orderFile.layout, tiles[from].key, target, rowKeys()))
       return
     }
     var tile = tiles[from]
     if (!tile || !target) return
     if (target.on) {
-      for (var i = 0; i < tiles.length; i++)
-        if (tiles[i].key === target.on && tiles[i].virtual) return
+      for (var i = 0; i < tiles.length; i++) {
+        if (tiles[i].key === target.on && tiles[i].virtual) {
+          var base = baseKey(target.on)
+          if (!base || base === tile.key) return
+          target = { side: target.side, on: base }
+          break
+        }
+      }
     }
     if (target.side === "row")
       saveLayout(LayoutModel.withRowPosition(orderFile.layout, tile.key, rowKeys(), target.index))
@@ -309,7 +320,9 @@ Column {
     function saveLayout(next) {
       layout = next
       setText(LayoutModel.serializeLayout(layout))
-      applier.apply()
+      root.tiles = LayoutModel.tilesFromMonitors(
+        root.monitors, layout.stack, layout.monitors, layout.order)
+      applier.apply(false, next)
     }
 
     // Service.qml sees the change and carries the mode out.
@@ -381,7 +394,7 @@ Column {
     id: row
     width: parent.width
     // Taller once a display stands above or below another.
-    height: canvas.stacked ? Style.space(170) : Style.space(110)
+    height: (canvas.stacked || root.reorderable) ? Style.space(170) : Style.space(110)
     hasCursor: root.cursorActive && root.focused
     foreground: root.bar.foreground
     outline: true
@@ -425,6 +438,8 @@ Column {
         return {
           key: tile.key,
           stacked: tile.stacked,
+          virtual: !!tile.virtual,
+          internal: !!tile.internal,
           left: groupLeft + (tile.x - bounds.left) * unit + gap / 2,
           top: groupTop + (tile.y - bounds.top) * unit + gap / 2,
           width: Math.max(1, tile.w * unit - gap),
@@ -440,6 +455,28 @@ Column {
 
       // Where the tile being dragged would land, for the edge marker.
       readonly property var dropPreview: dragIndex >= 0 ? target(dragIndex, dragX, dragY) : null
+
+      // Accent line on a neighbour: above/below that tile, or left/right of
+      // the insertion edge among remaining row tiles.
+      function dropSideFor(tileIndex) {
+        var p = dropPreview
+        if (!p) return ""
+        if ((p.side === "above" || p.side === "below") && tiles[tileIndex] && p.on === tiles[tileIndex].key)
+          return p.side
+        if (p.side !== "row" || dragIndex < 0) return ""
+        var remaining = []
+        for (var i = 0; i < tiles.length; i++) {
+          if (i === dragIndex || tiles[i].stacked) continue
+          remaining.push(i)
+        }
+        if (!remaining.length) return ""
+        var at = p.index
+        if (at <= 0) return remaining[0] === tileIndex ? "left" : ""
+        if (at >= remaining.length) return remaining[remaining.length - 1] === tileIndex ? "right" : ""
+        if (remaining[at - 1] === tileIndex) return "right"
+        if (remaining[at] === tileIndex) return "left"
+        return ""
+      }
 
       function finishDrag() {
         var from = dragIndex
@@ -474,7 +511,7 @@ Column {
           highlighted: modelData.focused
           grabbed: dragged || root.grabbedIndex === index
           hasCursor: root.cursorActive && root.focused && root.selectedIndex === index
-          dropSide: canvas.dropPreview && canvas.dropPreview.on === modelData.key ? canvas.dropPreview.side : ""
+          dropSide: canvas.dropSideFor(index)
 
           MouseArea {
             anchors.fill: parent
@@ -508,8 +545,8 @@ Column {
               // never reach the bottom or top edge of another to stack there.
               canvas.dragX = Math.max(-r.left - r.width / 2,
                 Math.min(canvas.width - r.left - r.width / 2, at.x - pressAt.x))
-              canvas.dragY = Math.max(-r.top - r.height / 2,
-                Math.min(canvas.height - r.top - r.height / 2, at.y - pressAt.y))
+              canvas.dragY = Math.max(-r.top - r.height,
+                Math.min(canvas.height - r.top, at.y - pressAt.y))
             }
             onReleased: canvas.finishDrag()
             onDoubleClicked: {
@@ -712,7 +749,7 @@ Column {
     property string icon: ""
     property string label: ""
     property int number: 0
-    // "above" / "below": the dragged display would land on this edge.
+    // "above" / "below" / "left" / "right": the dragged display would land here.
     property string dropSide: ""
     property bool highlighted: false
     property bool grabbed: false
@@ -727,13 +764,24 @@ Column {
     border.color: hasCursor ? root.bar.foreground : (highlighted ? Color.accent : line)
 
     Rectangle {
-      visible: tile.dropSide !== ""
+      visible: tile.dropSide === "above" || tile.dropSide === "below"
       anchors.left: parent.left
       anchors.right: parent.right
       anchors.top: tile.dropSide === "above" ? parent.top : undefined
       anchors.bottom: tile.dropSide === "below" ? parent.bottom : undefined
       height: Math.max(2, Style.space(3))
       radius: height / 2
+      color: Color.accent
+    }
+
+    Rectangle {
+      visible: tile.dropSide === "left" || tile.dropSide === "right"
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      anchors.left: tile.dropSide === "left" ? parent.left : undefined
+      anchors.right: tile.dropSide === "right" ? parent.right : undefined
+      width: Math.max(2, Style.space(3))
+      radius: width / 2
       color: Color.accent
     }
 

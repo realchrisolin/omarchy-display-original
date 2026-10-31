@@ -1174,87 +1174,44 @@ print(f"{hw}x{hh}@{refresh}|{x}x{y}|{vs:g}")
 PY
 }
 
-# Packed x y for the HEADLESS head: same row as USB-C/eDP from monitor-layout.json.
-# Ignores leftover extendPosition. Default: right of the hardware row.
+# Packed x y for the HEADLESS head from LayoutModel.computePositions (honors stack).
 pack_virtual_xy() {
-  python3 - "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/monitor-layout.json" <<'PY'
-import json, subprocess, sys
-from pathlib import Path
+  local xy
+  xy="$(_layout_model_node <<'JS'
+const Model = require(process.argv[2])
+let layout = {}
+let monitors = []
+try { layout = JSON.parse(process.env.LAYOUT_JSON || "{}") } catch (e) { layout = {} }
+try { monitors = JSON.parse(process.env.MONITORS_JSON || "[]") } catch (e) { monitors = [] }
+const xy = Model.packedVirtualXY(monitors, layout)
+process.stdout.write(String(xy.x) + " " + String(xy.y))
+JS
+)" || true
+  [[ -n "$xy" ]] || xy="0 0"
+  echo "$xy"
+}
 
-def is_virt(n):
-    n = str(n or "")
-    return (
-        n.startswith("HEADLESS")
-        or n == "persistent-miracast"
-        or n.startswith("persistent-miracast-")
-        or n == "Miracast"
-        or n.startswith("Miracast-")
-    )
-
-layout_path = Path(sys.argv[1])
-try:
-    layout = json.loads(layout_path.read_text())
-except Exception:
-    layout = {}
-order = list(layout.get("order") or [])
-saved = layout.get("monitors") or {}
-ms = json.loads(subprocess.check_output(["hyprctl", "-j", "monitors"], text=True, timeout=3))
-virt = next((m for m in ms if is_virt(m.get("name"))), None)
-if virt is None:
-    print("0 0")
-    raise SystemExit
-vname = str(virt.get("name") or "persistent-miracast")
-if vname not in order:
-    order.append(vname)
-by_key = {vname: virt}
-for m in ms:
-    if is_virt(m.get("name")):
-        continue
-    name = str(m.get("name") or "")
-    desc = " ".join(
-        p for p in (m.get("make"), m.get("model"), m.get("serial")) if p
-    ).strip() or str(m.get("description") or name)
-    by_key[desc] = m
-    by_key[name] = m
-
-def logical(m):
-    name = str(m.get("name") or "")
-    desc = " ".join(
-        p for p in (m.get("make"), m.get("model"), m.get("serial")) if p
-    ).strip() or str(m.get("description") or name)
-    s = saved.get(desc) or saved.get(name) or {}
-    try:
-        scale = float(s.get("scale") if s.get("scale") is not None else (m.get("scale") or 1)) or 1.0
-    except (TypeError, ValueError):
-        scale = 1.0
-    try:
-        t = int(s["transform"]) if s.get("transform") is not None else int(m.get("transform") or 0)
-    except (TypeError, ValueError):
-        t = 0
-    w, h = int(m.get("width") or 1920), int(m.get("height") or 1080)
-    if t % 2:
-        w, h = h, w
-    return int(round(w / scale)), int(round(h / scale))
-
-x = 0
-vx, vy = 0, 0
-seen = set()
-for key in order:
-    m = by_key.get(key)
-    if m is None:
-        continue
-    name = str(m.get("name") or "")
-    if name in seen:
-        continue
-    seen.add(name)
-    w, _h = logical(m)
-    if is_virt(name):
-        vx, vy = x, 0
-    x += w
-if vname not in seen:
-    vx, vy = x, 0
-print(f"{vx} {vy}")
-PY
+# Persist Left/Right/Above/Below into monitor-layout.json order+stack.
+sync_layout_extend_position() {
+  local position="${1:-right}"
+  _layout_model_node "$position" <<'JS' >/dev/null || return 0
+const fs = require("fs")
+const Model = require(process.argv[2])
+const path = process.env.HOME + "/.config/omarchy/monitor-layout.json"
+let layout = {}
+let monitors = []
+try { layout = JSON.parse(process.env.LAYOUT_JSON || "{}") } catch (e) { layout = {} }
+try { monitors = JSON.parse(process.env.MONITORS_JSON || "[]") } catch (e) { monitors = [] }
+const next = Model.layoutWithExtendPosition(layout, monitors, process.argv[3] || "right")
+const text = JSON.stringify(next, null, 2) + "\n"
+let prev = ""
+try { prev = fs.readFileSync(path, "utf8") } catch (e) {}
+if (prev === text) process.exit(0)
+try {
+  fs.mkdirSync(require("path").dirname(path), { recursive: true })
+  fs.writeFileSync(path, text)
+} catch (e) {}
+JS
 }
 
 # LayoutModel.js lives beside bin/ in the repo and in the installed plugin.
@@ -1954,6 +1911,7 @@ apply_extend_position() {
     return 1
   fi
   write_settings "extendPosition=$position" >/dev/null
+  sync_layout_extend_position "$position" || true
 
   local headless=""
   if [[ -f "$HEADLESS_FILE" ]]; then

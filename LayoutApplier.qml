@@ -34,10 +34,15 @@ QtObject {
   property var _monitors: []
   property string _pendingLua: ""
   property string _pendingJson: ""
+  // Arrangement saveLayout races FileView setText; cat would see the old row
+  // and persist it back, wiping stack.
+  property var _forcedLayout: null
 
   // positionsOnly: leave monitor settings alone, e.g. while a change made in
   // the properties window waits to be kept or reverted.
-  function apply(positionsOnly) {
+  function apply(positionsOnly, layoutOverride) {
+    if (layoutOverride)
+      root._forcedLayout = layoutOverride
     if (readProc.running || evalProc.running || modeProc.running) {
       _pending = true
       _pendingSettings = _pendingSettings || !positionsOnly
@@ -61,7 +66,9 @@ QtObject {
       waitForEnd: true
       onStreamFinished: {
         var parts = String(text || "").split("\u001e")
-        var layout = LayoutModel.parseLayout(parts[0])
+        var fileLayout = LayoutModel.parseLayout(parts[0])
+        var layout = root._forcedLayout || fileLayout
+        root._forcedLayout = null
         var monitors = []
         try { monitors = JSON.parse(parts[1] || "[]") } catch (e) { monitors = [] }
 
@@ -107,7 +114,8 @@ QtObject {
         if (!anyChanged && LayoutModel.packableOverlap(monitors))
           anyChanged = true
         if (!anyChanged) {
-          root._persistReloadLua(monitors, layout)
+          var same = LayoutModel.serializeLayout(layout) === LayoutModel.serializeLayout(fileLayout)
+          root._persistReloadLua(monitors, layout, !same)
           root._finish()
           return
         }
@@ -124,8 +132,8 @@ QtObject {
     onRunningChanged: if (!running) root._finish()
   }
 
-  function _persistReloadLua(monitors, layout) {
-    root._pendingJson = LayoutModel.serializeLayout(layout)
+  function _persistReloadLua(monitors, layout, writeJson) {
+    root._pendingJson = writeJson === false ? "" : LayoutModel.serializeLayout(layout)
     root._pendingLua = LayoutModel.physicalReloadLua(monitors, layout)
     root._flushLua()
   }

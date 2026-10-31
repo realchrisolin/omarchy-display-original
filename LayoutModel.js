@@ -815,20 +815,48 @@ function cleanStack(raw) {
 // the top or bottom `edge` share of another tile (or clear above or below it,
 // within its width) stacks it there: { side: "above" | "below", on: key },
 // provided it was moved that way by at least a quarter of its own height, so
-// a sideways drag never stacks by accident. Anywhere else it joins the row at `index` among the other row tiles, left
-// to right, by its center.
+// a sideways drag never stacks by accident. A drag that leaves the packed
+// group's left/right, or that is more sideways than vertical over a wifi
+// column, joins the row at `index` among the other row tiles, left to right,
+// by its center.
 function dropTarget(tiles, from, dx, dy, edge) {
   var t = tiles && tiles[from]
   if (!t) return null
   var share = edge > 0 && edge < 0.5 ? edge : 0.3
   var cx = t.left + t.width / 2 + (dx || 0)
   var cy = t.top + t.height / 2 + (dy || 0)
+  var adx = Math.abs(dx || 0)
+  var ady = Math.abs(dy || 0)
+  var vertical = ady >= t.height / 4
+  var mainlyVertical = vertical && ady >= adx
 
-  var vertical = Math.abs(dy || 0) >= t.height / 4
+  var rowLeft = Infinity
+  var rowRight = -Infinity
+  var overInternal = false
+  for (var b = 0; b < tiles.length; b++) {
+    rowLeft = Math.min(rowLeft, tiles[b].left)
+    rowRight = Math.max(rowRight, tiles[b].left + tiles[b].width)
+    if (b === from) continue
+    if (tiles[b].internal && cx >= tiles[b].left && cx <= tiles[b].left + tiles[b].width)
+      overInternal = true
+  }
+  var pastRow = rowRight > rowLeft && (cx < rowLeft || cx > rowRight)
+
+  // Wifi tile: above/below is always the laptop, not USB-C sitting in that slot.
+  // Past the left/right of the packed group, or a mainly-sideways drag, is a
+  // row insert so the above-edge marker does not steal left/right placement.
+  if (t.virtual && mainlyVertical && !pastRow) {
+    var home = null
+    for (var h = 0; h < tiles.length; h++) {
+      if (h !== from && tiles[h].internal) { home = tiles[h]; break }
+    }
+    if (home) return { side: (dy || 0) < 0 ? "above" : "below", on: home.key }
+  }
   var best = null
-  for (var i = 0; i < tiles.length && vertical; i++) {
+  for (var i = 0; i < tiles.length && vertical && !pastRow; i++) {
     if (i === from) continue
     var o = tiles[i]
+    if (o.virtual) continue
     if (cx < o.left || cx > o.left + o.width) continue
     var bottom = o.top + o.height
     var side = null
@@ -843,6 +871,22 @@ function dropTarget(tiles, from, dx, dy, edge) {
     if (side && (!best || distance < best.distance)) best = { distance: distance, on: o.key, side: side }
   }
   if (best) return { side: best.side, on: best.on }
+  // Miracast sits in the packed row. A mainly-vertical drag over that column
+  // (or over empty space above the row, still inside the group's x-span)
+  // should still stack on the laptop. Past the left/right ends, or a drag
+  // that is more sideways than vertical, stays a row insert.
+  if (mainlyVertical && !pastRow && !overInternal) {
+    var home = null
+    for (var h = 0; h < tiles.length; h++) {
+      if (h !== from && tiles[h].internal) { home = tiles[h]; break }
+    }
+    if (!home) {
+      for (var p = 0; p < tiles.length; p++) {
+        if (p !== from && !tiles[p].virtual) { home = tiles[p]; break }
+      }
+    }
+    if (home) return { side: (dy || 0) < 0 ? "above" : "below", on: home.key }
+  }
 
   var index = 0
   for (var j = 0; j < tiles.length; j++) {
@@ -1149,7 +1193,7 @@ function tilesFromMonitors(monitors, stack, monitorSettings, order) {
       internal: isInternal(monitor),
       virtual: virtual,
       focused: monitor.focused === true,
-      stacked: virtual ? false : !!active[monitorKey(monitor, shared)],
+      stacked: !!active[key],
       x: slot ? slot.x : (Number(monitor.x) || 0),
       y: slot ? slot.y : (Number(monitor.y) || 0),
       w: size.w,
@@ -1162,6 +1206,110 @@ function tilesFromMonitors(monitors, stack, monitorSettings, order) {
 
 // Put the Miracast tile outside the packed physical row. Placing it only
 // against eDP overlapped USB-C when that panel already sat left of the laptop.
+// Packed x,y for the first virtual head (computePositions + stack).
+function packedVirtualXY(monitors, layout) {
+  var list = monitors || []
+  var virt = null
+  for (var i = 0; i < list.length; i++) {
+    if (isVirtualHead(list[i])) { virt = list[i]; break }
+  }
+  if (!virt) return { x: 0, y: 0 }
+  var order = ((layout && layout.order) || []).slice()
+  var vname = String(virt.name)
+  if (order.indexOf(vname) < 0) order.push(vname)
+  var positions = computePositions(
+    list, order, (layout && layout.stack) || {}, (layout && layout.monitors) || {}
+  )
+  for (var p = 0; p < positions.length; p++) {
+    if (String(positions[p].name) === vname)
+      return { x: positions[p].x, y: positions[p].y }
+  }
+  return { x: 0, y: 0 }
+}
+
+// Arrangement drop of the Miracast tile: row insert, or stack above/below a physical tile.
+function applyVirtualDrop(layout, virtKey, target, rowKeys) {
+  if (!layout || !virtKey) return layout
+  if (!target) return layout
+  if (target.side === "row")
+    return withRowPosition(layout, virtKey, rowKeys || [], target.index)
+  if ((target.side === "above" || target.side === "below") && target.on && target.on !== virtKey)
+    return withVirtualStacked(layout, virtKey, target.on, target.side)
+  return layout
+}
+
+// Miracast above/below a physical monitor. Do not pile on USB-C that already
+// occupies that side — that is the DISPLAY SETTINGS "above Built-In" miss.
+function withVirtualStacked(layout, virtKey, on, side) {
+  if (!virtKey || !on || virtKey === on) return copyLayout(layout)
+  var stack = {}
+  var source = (layout && layout.stack) || {}
+  var dir = side === "below" ? "below" : "above"
+  for (var k in source) {
+    if (!Object.prototype.hasOwnProperty.call(source, k) || k === virtKey) continue
+    if (source[k].on === on && source[k].side === dir) continue
+    stack[k] = source[k]
+  }
+  stack[virtKey] = { on: on, side: dir }
+  var copy = copyLayout(layout)
+  copy.stack = stack
+  return copy
+}
+
+function _internalKey(monitors) {
+  var list = monitors || []
+  for (var i = 0; i < list.length; i++) {
+    if (isInternal(list[i]) && isArrangeable(list[i])) return monitorKey(list[i])
+  }
+  for (var j = 0; j < list.length; j++) {
+    if (isArrangeable(list[j])) return monitorKey(list[j])
+  }
+  return ""
+}
+
+function _virtKey(monitors) {
+  var list = monitors || []
+  for (var i = 0; i < list.length; i++) {
+    if (isVirtualHead(list[i])) return String(list[i].name)
+  }
+  return ""
+}
+
+function _rowKeysWithout(layout, monitors, skip) {
+  var order = (layout && layout.order) || []
+  var stack = activeStack(monitors, (layout && layout.stack) || {})
+  var keys = []
+  var seen = {}
+  function push(key) {
+    if (!key || key === skip || seen[key] || stack[key]) return
+    seen[key] = true
+    keys.push(key)
+  }
+  for (var i = 0; i < order.length; i++) push(order[i])
+  var list = monitors || []
+  var shared = sharedDescriptions(list.filter(isPackable))
+  for (var j = 0; j < list.length; j++) {
+    if (isVirtualHead(list[j])) push(String(list[j].name))
+    else if (isArrangeable(list[j])) push(monitorKey(list[j], shared))
+  }
+  return keys
+}
+
+// Pills Left/Right/Above/Below → layout.order + layout.stack.
+function layoutWithExtendPosition(layout, monitors, position) {
+  var virtKey = _virtKey(monitors)
+  var edpKey = _internalKey(monitors)
+  if (!virtKey) return copyLayout(layout)
+  var pos = String(position || "right")
+  if (pos === "above" || pos === "below") {
+    if (!edpKey) return copyLayout(layout)
+    return withVirtualStacked(layout, virtKey, edpKey, pos)
+  }
+  var row = _rowKeysWithout(layout, monitors, virtKey)
+  if (pos === "left") return withRowPosition(layout, virtKey, row, 0)
+  return withRowPosition(layout, virtKey, row, row.length)
+}
+
 function applyExtendPreview(tiles, extendPosition) {
   var virt = null
   var left = Infinity
@@ -1304,6 +1452,10 @@ if (typeof module !== "undefined") {
     isPackable: isPackable,
     migrateLayoutOrder: migrateLayoutOrder,
     tilesFromMonitors: tilesFromMonitors,
+    packedVirtualXY: packedVirtualXY,
+    applyVirtualDrop: applyVirtualDrop,
+    withVirtualStacked: withVirtualStacked,
+    layoutWithExtendPosition: layoutWithExtendPosition,
     applyExtendPreview: applyExtendPreview,
     extendPositionFromDrop: extendPositionFromDrop,
     withDisplayEnabled: withDisplayEnabled
