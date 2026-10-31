@@ -5710,15 +5710,54 @@ except Exception: print("")' 2>/dev/null || true)"
     rm -f "$AUDIO_DEFAULT_HOLD_FILE"
   fi
   if pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$MIRACAST_AUDIO_SINK_NAME"; then
-    hold_audio_default_until_play || true
-    start_miracast_audio_route_watcher || true
-    echo "$MIRACAST_AUDIO_SINK_NAME"
-    return 0
+    # PipeWire defaults monitor.passthrough=true on null sinks. The monitor
+    # then copies one stream (often miracast-silence /dev/zero) instead of
+    # mixing app playback, so WFD LPCM is silent while the bar visualizer
+    # still sees audio via stream.capture.sink.
+    local _pt=""
+    _pt="$(python3 -c 'import json,subprocess,sys
+try:
+    data=json.loads(subprocess.check_output(["pw-dump"], text=True))
+except Exception:
+    sys.exit(0)
+for o in data:
+    p=(o.get("info") or {}).get("props") or {}
+    if p.get("node.name")=="'"$MIRACAST_AUDIO_SINK_NAME"'" and p.get("media.class")=="Audio/Sink":
+        v=str(p.get("monitor.passthrough","")).lower()
+        print("1" if v in ("true","1","yes") else "0")
+        break
+' 2>/dev/null || true)"
+    if [[ "$_pt" == "1" ]]; then
+      echo "[miracast-ctl] recreating $MIRACAST_AUDIO_SINK_NAME with monitor.passthrough=false" >>"$LOG_DIR/cast.log"
+      if [[ -f "$AUDIO_SILENCE_PID_FILE" ]]; then
+        local _spid
+        _spid="$(tr -d '[:space:]' <"$AUDIO_SILENCE_PID_FILE" 2>/dev/null || true)"
+        rm -f "$AUDIO_SILENCE_PID_FILE"
+        [[ -n "$_spid" ]] && kill "$_spid" 2>/dev/null || true
+      fi
+      local _mid=""
+      if [[ -f "$AUDIO_SINK_MODULE_FILE" ]]; then
+        _mid="$(tr -d '[:space:]' <"$AUDIO_SINK_MODULE_FILE" 2>/dev/null || true)"
+        rm -f "$AUDIO_SINK_MODULE_FILE"
+      fi
+      [[ -n "$_mid" ]] && pactl unload-module "$_mid" 2>/dev/null || true
+      if pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$MIRACAST_AUDIO_SINK_NAME"; then
+        pactl list short modules 2>/dev/null | awk '/module-null-sink/ && /sink_name='"$MIRACAST_AUDIO_SINK_NAME"'/{print $1; exit}' | while read -r m; do
+          pactl unload-module "$m" 2>/dev/null || true
+        done
+      fi
+      sleep 0.2
+    else
+      hold_audio_default_until_play || true
+      start_miracast_audio_route_watcher || true
+      echo "$MIRACAST_AUDIO_SINK_NAME"
+      return 0
+    fi
   fi
   local mid
   mid="$(pactl load-module module-null-sink \
     "sink_name=$MIRACAST_AUDIO_SINK_NAME" \
-    "sink_properties=device.description=$MIRACAST_AUDIO_SINK_DESC" 2>/dev/null || true)"
+    "sink_properties=device.description=$MIRACAST_AUDIO_SINK_DESC monitor.passthrough=false" 2>/dev/null || true)"
   if [[ -z "$mid" ]]; then
     echo "[miracast-ctl] failed to create Miracast audio sink" >>"$LOG_DIR/cast.log"
     rm -f "$AUDIO_DEFAULT_HOLD_FILE"
@@ -6705,7 +6744,7 @@ elif strat == "smartview" or rc == "QVBR":
     try:
         v = float(raw)
     except ValueError:
-        v = QVBR_VBV_MULTIPLIER
+        v = 0.25
     print("%g" % max(0.05, min(0.25, v)))
 else:
     enc = bitrate_to_mbps(s.get("vaapiBitrate") or s.get("bitrate") or "2.4M")

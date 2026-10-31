@@ -16,6 +16,8 @@ Without sink RTCP, we do **not** invent LOSS from iw retry%%. Demote on
 NetworkStall (fps/sender), hard tx_failed, or a sink WFD IDR burst
 (decoder starvation). Climb init→max when healthy. QP fill toward the
 encode setpoint so VAAPI QVBR actually spends bits (CAC-in-VBR).
+CEA fps stays at the preferred M4 mode; idle QVBR undershoot is not a
+reason to drop 1080p60→p30.
 
 Pure functions / small state object — no I/O.
 """
@@ -69,10 +71,8 @@ APPLY_FLUSH_INTERVAL_S = 120.0
 APPLY_FLUSH_QP_DELTA = 2
 APPLY_FLUSH_KBPS_FRAC = 0.15
 
-# 1080p60 at <4 Mbps looks worse than 1080p30. Restore 60 fps once encode recovers.
-FPS60_DROP_KBPS = 4_000
-FPS60_RESTORE_KBPS = 7_000
-FPS60_DROP_TICKS = 3
+# CEA fps is locked to the preferred M4 mode (Smart View). QVBR idle
+# undershoot is not congestion — do not drop 1080p60→p30 on air fill.
 
 
 @dataclass
@@ -551,27 +551,23 @@ def abr_stream_mode(
     preferred_mode: str,
     low_streak: int,
 ) -> tuple[str, int]:
-    """Drop 1080p60 → 1080p30 when encode is stuck under 4 Mbps.
+    """Keep preferred CEA fps. Smart View locks mode at M4.
 
-    Preferred 60 fps is restored at ≥7 Mbps. Resolution is unchanged.
+    Bitrate/QP adapt on stall, IDR burst, and real RTCP loss. QVBR idle
+    undershoot (cursor, bar) is not congestion, so air fill must not drop
+    1080p60→p30. ``applied_kbps`` is accepted for API compat and ignored.
+    If a previous air-fill heuristic left 1080p30 while preferred is 60,
+    restore 60. User-preferred 30 fps is left alone.
     """
+    del applied_kbps, low_streak
     w, h, cur_fps = parse_stream_mode(stream_mode)
     pw, ph, pref_fps = parse_stream_mode(preferred_mode or stream_mode)
     if pref_fps < 60 or max(h, ph) < 1080:
         return f"{w}x{h}p{cur_fps}", 0
-    kbps = int(applied_kbps)
-    streak = int(low_streak or 0)
     if cur_fps >= 60:
-        if kbps < FPS60_DROP_KBPS:
-            streak += 1
-            if streak >= FPS60_DROP_TICKS:
-                return f"{w}x{h}p30", 0
-            return f"{w}x{h}p{cur_fps}", streak
         return f"{w}x{h}p{cur_fps}", 0
-    if kbps >= FPS60_RESTORE_KBPS:
-        rw, rh = (pw, ph) if ph >= 1080 else (w, h)
-        return f"{rw}x{rh}p60", 0
-    return f"{w}x{h}p30", 0
+    rw, rh = (pw, ph) if ph >= 1080 else (w, h)
+    return f"{rw}x{rh}p60", 0
 
 
 def kbps_to_ffmpeg(kbps: int) -> str:

@@ -559,7 +559,7 @@ def main(argv: list[str] | None = None) -> int:
     sv_applied_qp: int | None = None
     sv_last_apply_ts = 0.0
     sv_pending = None  # last BitrateDecision waiting for coalesce gate
-    fps_low_streak = 0  # 1080p60 stuck-under-4M ticks before dropping to p30
+    fps_low_streak = 0  # unused; abr_stream_mode no longer drops on air fill
     abr_preferred_mode = ""  # user 1080p60; ABR p30 must not overwrite restore
     bc_mod = None  # bitrate_controller module (load once)
     es_mod = None  # encode_strategy (DMA-BUF QVBR starve → pipe)
@@ -1283,19 +1283,15 @@ def main(argv: list[str] | None = None) -> int:
                             abr_preferred_mode = file_pref
                         elif not abr_preferred_mode and cur_mode:
                             abr_preferred_mode = cur_mode
-                        # Stuck = observed air fill, not the QVBR setpoint
-                        # (setpoint can climb to 4M+ while encode still fills 2M).
-                        fill_kbps = applied_now
-                        if (
-                            mbps is not None
-                            and not (mbps < 0.15 and video_ok)
-                        ):
-                            fill_kbps = max(0, int(round(float(mbps) * 1000.0)))
+                        # CEA fps stays at preferred M4 (Smart View). Do not
+                        # treat QVBR idle air fill as congestion — that was
+                        # dropping 1080p60→p30 on cursor/bar. Bitrate/QP still
+                        # move via decide() on stall / IDR / RTCP.
                         if in_abr_grace or capture_hold:
                             want_mode = cur_mode
                         else:
                             want_mode, fps_low_streak = bc_mod.abr_stream_mode(
-                                applied_kbps=fill_kbps,
+                                applied_kbps=applied_now,
                                 stream_mode=cur_mode,
                                 preferred_mode=abr_preferred_mode or cur_mode,
                                 low_streak=fps_low_streak,
@@ -1309,8 +1305,8 @@ def main(argv: list[str] | None = None) -> int:
                         ):
                             _log(
                                 cast_log,
-                                f"abr fps {cur_mode}→{want_mode} at "
-                                f"{fill_kbps}kbps air (setpoint {applied_now}kbps)",
+                                f"abr fps {cur_mode}→{want_mode} "
+                                f"(restore preferred; setpoint {applied_now}kbps)",
                             )
                             try:
                                 subprocess.run(

@@ -26,6 +26,9 @@ Uses those Samsung min/init/max/QP values. Enabled when
 **`encodeStrategy=smartview`** and **`encodeProfile=best`**. Prefers
 **DMA-BUF + QVBR** (`prepare_dmabuf_settings`); session may fall back to pipe.
 **`encodeStrategy=performance`** keeps DMA-BUF **CQP** (no `set-bitrate-kbps`).
+CEA fps stays at the preferred M4 mode (typically 1080p60). QVBR idle
+undershoot is not congestion; kbps/QP still move on stall, sink IDR burst,
+and real RTCP loss.
 
 ### VAAPI QVBR must hit the bitrate target
 Intel QVBR with fixed `qp=` undershoots to ~2–3 Mbps and looks pixelated.

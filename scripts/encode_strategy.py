@@ -149,7 +149,12 @@ def prepare_dmabuf_settings(settings: dict[str, Any]) -> dict[str, Any]:
         else:
             if gop_now is None:
                 settings["vaapiGop"] = one_sec
-            settings["vbvMultiplier"] = f"{QVBR_VBV_MULTIPLIER:g}"
+            try:
+                vbv_now = float(settings.get("vbvMultiplier") or 0)
+            except (TypeError, ValueError):
+                vbv_now = 0.0
+            if vbv_now < 0.05:
+                settings["vbvMultiplier"] = f"{QVBR_VBV_MULTIPLIER:g}"
     return {
         "encodeStrategy": strat,
         "captureEncode": settings.get("captureEncode"),

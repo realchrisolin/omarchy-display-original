@@ -131,4 +131,7 @@ damage-only screen capture starving the mux.
 - Sink / silence feeder: Omarchy `miracast-ctl` Miracast null sink + `pacat`
   keep-alive (`application.name=miracast-silence`, PipeWire
   `node.name=omarchy_speaker_tuning.miracast_feeder` so the Omarchy sound
-  panel SOURCES list hides it)
+  panel SOURCES list hides it). Create the sink with
+  `monitor.passthrough=false` so `miracast.monitor` mixes app playback;
+  PipeWire’s default passthrough copies the silence feeder and the stick
+  stays mute while omaudix still visualizes the sink.

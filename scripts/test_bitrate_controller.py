@@ -330,29 +330,19 @@ class BitrateControllerTest(unittest.TestCase):
         self.assertTrue(ok, why)
         self.assertNotIn("179", why)
 
-    def test_drop_1080p60_when_stuck_under_4m(self):
+    def test_idle_undershoot_keeps_1080p60(self):
         mode, streak = bc.abr_stream_mode(
             applied_kbps=2300,
             stream_mode="1920x1080p60",
             preferred_mode="1920x1080p60",
-            low_streak=2,
-        )
-        self.assertEqual(mode, "1920x1080p30")
-        self.assertEqual(streak, 0)
-
-    def test_hold_1080p60_until_stuck_ticks(self):
-        mode, streak = bc.abr_stream_mode(
-            applied_kbps=2300,
-            stream_mode="1920x1080p60",
-            preferred_mode="1920x1080p60",
-            low_streak=0,
+            low_streak=9,
         )
         self.assertEqual(mode, "1920x1080p60")
-        self.assertEqual(streak, 1)
+        self.assertEqual(streak, 0)
 
-    def test_restore_1080p60_when_bitrate_recovers(self):
+    def test_restore_preferred_1080p60_from_p30(self):
         mode, streak = bc.abr_stream_mode(
-            applied_kbps=8000,
+            applied_kbps=2300,
             stream_mode="1920x1080p30",
             preferred_mode="1920x1080p60",
             low_streak=0,
@@ -375,26 +365,6 @@ class BitrateControllerTest(unittest.TestCase):
             low_streak=9,
         )
         self.assertEqual(mode, "1920x1080p30")
-
-    def test_hold_1080p60_at_drop_threshold(self):
-        mode, streak = bc.abr_stream_mode(
-            applied_kbps=4000,
-            stream_mode="1920x1080p60",
-            preferred_mode="1920x1080p60",
-            low_streak=9,
-        )
-        self.assertEqual(mode, "1920x1080p60")
-        self.assertEqual(streak, 0)
-
-    def test_hold_1080p30_until_restore_threshold(self):
-        mode, streak = bc.abr_stream_mode(
-            applied_kbps=6999,
-            stream_mode="1920x1080p30",
-            preferred_mode="1920x1080p60",
-            low_streak=0,
-        )
-        self.assertEqual(mode, "1920x1080p30")
-        self.assertEqual(streak, 0)
 
     def test_parse_stream_mode(self):
         self.assertEqual(bc.parse_stream_mode("1920x1080p60"), (1920, 1080, 60))
