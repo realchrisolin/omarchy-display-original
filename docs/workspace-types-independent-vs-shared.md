@@ -42,7 +42,7 @@ Commit `3c8963d` — `fix: re-pin ext-* to Miracast head on every Persist connec
 One-shot live repair during the incident also moved `ext-1` → Miracast and `3` → eDP.
 
 ### Independent model (current product behavior)
-This is what Omarchy Miracast + `colin.workspaces` already implement:
+This is what Omarchy Miracast + `realchrisolin.workspaces` already implement:
 
 | Display | Workspace identity | Switching |
 |---------|-------------------|-----------|
@@ -52,7 +52,7 @@ This is what Omarchy Miracast + `colin.workspaces` already implement:
 - **Two separate pools** of desktops (different workspace objects).
 - Switching on one monitor does **not** change the other monitor’s active workspace.
 - Windows live on exactly one workspace → one monitor at a time.
-- Bar strip: laptop shows numeric slots; Miracast / HDMI show `ext-*` slots (`colin.workspaces`).
+- Bar strip: laptop shows numeric slots; Miracast / HDMI show `ext-*` slots (`realchrisolin.workspaces`).
 
 Related settings (orthogonal to WORKSPACE TYPE):
 
@@ -193,7 +193,7 @@ Updated coherent modes:
 #### Phase 2 — Shared pool (A)
 - [ ] On connect in `shared`: do **not** seed `ext-*`; ensure cast head takes next free numeric or last-used WS  
 - [ ] Disable / no-op moves that force `ext-*` onto cast  
-- [ ] `omarchy-hyprland-workspace-focus` + `colin.workspaces`: when focused monitor is Miracast, SUPER+N targets global numerics (same as eDP), not `ext-N`  
+- [ ] `omarchy-hyprland-workspace-focus` + `realchrisolin.workspaces`: when focused monitor is Miracast, SUPER+N targets global numerics (same as eDP), not `ext-N`  
 - [ ] Migrate existing `ext-*` windows onto numeric WS once when switching independent → shared (one-shot prompt)  
 - [ ] Disconnect: optional migrate cast WS back to eDP vs leave on parked head (Persist)
 
@@ -227,7 +227,7 @@ Updated coherent modes:
 - “Bind workspace to multiple monitors”: https://github.com/hyprwm/Hyprland/discussions/10088  
 - Forum: workspaces across two monitors (KDE-like): https://forum.hypr.land/t/workspaces-on-multiple-monitors/1371  
 - Per-monitor numbering (not same WS): hyprsplit / split-monitor-workspaces / hypr-local-workspaces  
-- Local: `pin_extend_workspaces` / `seed_extend_workspaces` in `bin/miracast-ctl`; `colin.workspaces` bar strip  
+- Local: `pin_extend_workspaces` / `seed_extend_workspaces` in `bin/miracast-ctl`; `realchrisolin.workspaces` bar strip  
 
 ---
 
