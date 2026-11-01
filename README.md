@@ -47,33 +47,33 @@ WirePlumber or PulseAudio, `iw`, `nmcli`, Python 3. Optional: `ufw` so
 **From git (recommended for users):**
 
 ```bash
-omarchy plugin add https://github.com/realchrisolin/omarchy-miracast.git --enable
+omarchy plugin add https://github.com/realchrisolin/omarchy-display.git --enable
 ```
 
 That clones into `~/.config/omarchy/plugins/<id>/` (id comes from
-`manifest.json`, e.g. `realchrisolin.monitor`), places the bar widget, and enables it.
+`manifest.json`, e.g. `realchrisolin.display`), places the bar widget, and enables it.
 Disable the stock Display widget if it is still enabled:
 
 ```bash
 omarchy plugin disable omarchy.monitor
-omarchy plugin list   # expect your *.monitor enabled, omarchy.monitor disabled
+omarchy plugin list   # expect realchrisolin.display enabled, omarchy.monitor disabled
 ```
 
 **From a local checkout (developers):** keep one git tree and symlink it so edits
 hot-reload without copying:
 
 ```bash
-git clone https://github.com/realchrisolin/omarchy-miracast.git ~/code/other/omarchy-miracast
+git clone https://github.com/realchrisolin/omarchy-display.git ~/code/other/omarchy-display
 mkdir -p ~/.config/omarchy/plugins
-ln -sfn ~/code/other/omarchy-miracast ~/.config/omarchy/plugins/realchrisolin.monitor
+ln -sfn ~/code/other/omarchy-display ~/.config/omarchy/plugins/realchrisolin.display
 
-omarchy plugin validate ~/.config/omarchy/plugins/realchrisolin.monitor
-omarchy plugin enable realchrisolin.monitor --section right   # or left / center
+omarchy plugin validate ~/.config/omarchy/plugins/realchrisolin.display
+omarchy plugin enable realchrisolin.display --section right   # or left / center
 omarchy plugin disable omarchy.monitor
 ```
 
 Confirm `~/.config/omarchy/shell.json` bar layout references your plugin id
-(e.g. `"id": "realchrisolin.monitor"`), not `omarchy.monitor`. Soft-reload:
+(e.g. `"id": "realchrisolin.display"`), not `omarchy.monitor`. Soft-reload:
 
 ```bash
 omarchy-shell shell rescanPlugins
@@ -105,7 +105,7 @@ cd ~/code/other/fluxcast && git checkout feat/wfd-hw-encode-modes   # if using t
 
 1. `$FLUXCAST_ROOT` (environment)
 2. `fluxcastRoot` in `~/.config/omarchy-miracast/settings.json` (`~/…` or `$HOME/…` OK)
-3. Sibling `../fluxcast` next to this plugin checkout (e.g. `~/code/other/fluxcast` beside `~/code/other/omarchy-miracast`)
+3. Sibling `../fluxcast` next to this plugin checkout (e.g. `~/code/other/fluxcast` beside `~/code/other/omarchy-display`)
 
 ```bash
 # Portable — prefer $HOME, not a hard-coded /home/<user>/…
@@ -124,7 +124,7 @@ The panel always runs `pluginDir/bin/miracast-ctl`. For a terminal:
 
 ```bash
 mkdir -p ~/.local/bin
-ln -sfn ~/.config/omarchy/plugins/realchrisolin.monitor/bin/miracast-ctl ~/.local/bin/miracast-ctl
+ln -sfn ~/.config/omarchy/plugins/realchrisolin.display/bin/miracast-ctl ~/.local/bin/miracast-ctl
 # ~/.local/bin is usually already on PATH on Omarchy
 miracast-ctl status
 miracast-ctl doctor

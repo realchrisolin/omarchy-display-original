@@ -1,4 +1,4 @@
--- Loaded from ~/.config/hypr/bindings.lua when realchrisolin.monitor is installed.
+-- Loaded from ~/.config/hypr/bindings.lua when realchrisolin.display is installed.
 -- SUPER+SHIFT+ALT+arrows still moves the whole workspace (Omarchy tiling.lua).
 -- These send only the focused window onto the other display's active workspace.
 o.bind(

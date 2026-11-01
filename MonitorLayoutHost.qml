@@ -6,7 +6,7 @@ import "LayoutModel.js" as LayoutModel
 
 // Always-on layout host, parented by DisplayPanel (bar widget).
 // Not a separate plugin service: Qt reports "File name case mismatch" when
-// createComponent loads through the realchrisolin.monitor symlink.
+// createComponent loads through the realchrisolin.display symlink.
 // Keeps physical monitors in the saved left-to-right order. Miracast virtual
 // heads (persistent-miracast / HEADLESS*) are skipped in LayoutModel.isArrangeable.
 // Holds apply during P2P/RTSP handshake. After each apply, re-places or parks

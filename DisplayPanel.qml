@@ -18,8 +18,8 @@ import "LayoutModel.js" as LayoutModel
 // "toggle".
 Panel {
   id: root
-  moduleName: "realchrisolin.monitor"
-  ipcTarget: "realchrisolin.monitor"
+  moduleName: "realchrisolin.display"
+  ipcTarget: "realchrisolin.display"
   manageIpc: false
 
   // Bar widgets are copied per screen. Only the first screen owns IPC and
@@ -280,7 +280,7 @@ Panel {
     active: root.singletonOwner
     sourceComponent: Component {
       IpcHandler {
-        target: "realchrisolin.monitor"
+        target: "realchrisolin.display"
 
         function brightness(percent: string): string { return root.brightnessIpc(percent) }
         function state(): string { return root.stateIpc() }

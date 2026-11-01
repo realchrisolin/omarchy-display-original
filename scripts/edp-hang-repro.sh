@@ -19,7 +19,7 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 RUN="$BASE/$RUN_ID"
 HEADLESS="${HEADLESS_NAME:-persistent-miracast}"
 WF_BIN="${WF_RECORDER_BIN:-/home/colin/src/wf-recorder/build/wf-recorder}"
-ICC_SO="${ICC_SO:-/home/colin/code/other/omarchy-miracast/hyprland-plugins/icc-present-kick/icc-present-kick.so}"
+ICC_SO="${ICC_SO:-/home/colin/code/other/omarchy-display/hyprland-plugins/icc-present-kick/icc-present-kick.so}"
 SOAK_S="${SOAK_S:-4}"
 CAPTURE_S="${CAPTURE_S:-8}"
 # scale 2 + left + 1920x1080@60 matches hotyeah settings at the 21:41 hang.

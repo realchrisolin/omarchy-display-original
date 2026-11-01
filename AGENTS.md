@@ -1,6 +1,6 @@
 # Omarchy Miracast / Display plugin
 
-Quickshell Display bar plugin (`manifest.json` id **`realchrisolin.monitor`**) plus `bin/miracast-ctl` and `scripts/`. Cast path depends on a patched **FluxCast** tree (see README / BUILD.md).
+Quickshell Display bar plugin (`manifest.json` id **`realchrisolin.display`**) plus `bin/miracast-ctl` and `scripts/`. Cast path depends on a patched **FluxCast** tree (see README / BUILD.md).
 
 Keep this file short. Depth lives in the docs below — link, don’t paste.
 
@@ -30,7 +30,7 @@ Keep this file short. Depth lives in the docs below — link, don’t paste.
 - **Disconnected cleanup (no sink):** when cast pid, FluxCast python, and P2P group are all gone, `cmd_status` must (a) persist `phase=idle` over stale `error`/connecting phases, (b) reap link/audio/health watchers, (c) clear `parked-headless.name` / `headless.name` only when Hyprland IPC works and the named head is absent (after compositor restart), (d) if the head still exists but is on-layout, re-park it at `-12000x0` (never `output remove`). Idle status must **not** `wpa_cli p2p_peer` the last TV — only probe while running/linkUp/live phase or a P2P GO iface exists (`attach_radio_channel_fields.should_probe_p2p_peer`).
 - **Dead sink → stop (not endless restart):** `miracast_link_watch.py` must `miracast-ctl stop` when the TV is gone but P2P/FluxCast linger — peer inactive / no stations, UDP send-error storm, or sustained TX≈0. Otherwise the UI stays on `streaming`.
 - **Demote on failures / fps sag / severe retries, not Mbps:** prefer **tx failed** / UDP / true stalls. **Video fps &lt; ~28** demotes on the **first** bad tick; **fps &lt; ~24** is severe. In the **cliff zone (≈qp≤10)**, fps&lt;29 and any tx-failed are severe (multi-step). Mild MCC retry% alone must **not** demote (only ≥~5%). Do **not** use a TX Mbps ceiling under CQP.
-- **Plugin id** is `realchrisolin.monitor` (not `colin.monitor` / not stock `omarchy.monitor`).
+- **Plugin id** is `realchrisolin.display` (not `colin.display` / not stock `omarchy.monitor`).
 - **Privacy in logs / commits / public benches:** scrub SSIDs and MACs; use the sanitize helpers when publishing benchmarks.
 
 ## v2 Display (`v2-dev`)
