@@ -135,3 +135,11 @@ damage-only screen capture starving the mux.
   `monitor.passthrough=false` so `miracast.monitor` mixes app playback;
   PipeWire’s default passthrough copies the silence feeder and the stick
   stays mute while omaudix still visualizes the sink.
+- Echo cancel: while streaming, native `libpipewire-module-echo-cancel`
+  (`monitor.mode`) uses `miracast.monitor` as the AEC reference. The user
+  keeps **Miracast** as the speaker and **Built-In** as the mic; analog
+  captures are pinned onto a hidden cancelled source
+  (`omarchy_speaker_tuning.miracast_aec`). No extra output device.
+  Off via Audio panel “Cancel echo from display”, settings
+  `echoCancelMiracast`, or `MIRACAST_AEC=0`. Holder process dies on
+  sink teardown.

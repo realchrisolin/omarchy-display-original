@@ -16,10 +16,24 @@ LINK_WATCH_PID_FILE="$STATE_DIR/link-watch.pid"
 HEALTH_WATCH_PID_FILE="$STATE_DIR/health-watch.pid"
 # Hardware (or prior) default sink to restore until PLAY, and after teardown.
 AUDIO_PREV_DEFAULT_FILE="$STATE_DIR/audio-prev-default"
+AUDIO_PREV_SOURCE_FILE="$STATE_DIR/audio-prev-source"
+AUDIO_AEC_MODULE_FILE="$STATE_DIR/audio-aec.module"
+AUDIO_AEC_MIC_FILE="$STATE_DIR/audio-aec.mic"
 # While present: do not allow Miracast to become/stay the default sink.
 AUDIO_DEFAULT_HOLD_FILE="$STATE_DIR/audio-default-hold"
 MIRACAST_AUDIO_SINK_NAME="miracast"
 MIRACAST_AUDIO_SINK_DESC="Miracast"
+# PipeWire echo-cancel wrap: apps play/capture here; playback still hits
+# miracast so FluxCast can read miracast.monitor. Cancels TV echo in the mic.
+MIRACAST_AEC_SINK_NAME="miracast_aec_out"
+# Hidden from Omarchy stream lists; analog captures are pinned here while
+# Miracast is the speaker. User keeps Built-In mic + Miracast output.
+MIRACAST_AEC_SOURCE_NAME="omarchy_speaker_tuning.miracast_aec"
+AUDIO_AEC_PID_FILE="$STATE_DIR/audio-aec.pid"
+# pw-cli -m holds the echo-cancel module. Killing the holder without this
+# pid leaves the module loaded (pw-cli ignores FIFO EOF in monitor mode).
+AUDIO_AEC_PWCLI_PID_FILE="$STATE_DIR/audio-aec.pwcli.pid"
+AUDIO_AEC_FIFO="$STATE_DIR/aec.pwcli"
 STATUS_FILE="$STATE_DIR/status.json"
 SETTINGS_FILE="$CONFIG_DIR/settings.json"
 PEERS_FILE="$STATE_DIR/peers.json"
@@ -490,6 +504,9 @@ defaults = {
     # If true: set default sink to Miracast at PLAY. If false: keep whatever
     # output was selected (still hold speakers during handshake against WP).
     "autoSwitchAudioOutput": True,
+    # Subtract Miracast/TV playback from the analog mic (WebRTC AEC) so calls
+    # do not howl. UI: Audio panel checkbox. MIRACAST_AEC=0 still forces off.
+    "echoCancelMiracast": True,
     # Preferred Miracast stream mode id, e.g. "1280x720p30".
     "streamMode": "1280x720p30",
     # Display panel: false = expand all outputs; true = accordion (focused only).
@@ -4315,6 +4332,72 @@ print(json.dumps({"ok": True, "autoSwitchAudioOutput": on}, separators=(",", ":"
 PY
 }
 
+echo_cancel_miracast_on() {
+  case "${MIRACAST_AEC:-}" in
+    0|false|no|off|FALSE|NO|OFF) return 1 ;;
+  esac
+  local v
+  v="$(python3 - "$SETTINGS_FILE" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+val = data.get("echoCancelMiracast", True)
+if isinstance(val, str):
+    print("1" if val.strip().lower() in ("1", "true", "yes", "on") else "0")
+else:
+    print("1" if val else "0")
+PY
+)"
+  [[ "$v" == 1 ]]
+}
+
+cmd_get_echo_cancel() {
+  if echo_cancel_miracast_on; then
+    emit '{"ok":true,"echoCancelMiracast":true}'
+  else
+    emit '{"ok":true,"echoCancelMiracast":false}'
+  fi
+}
+
+cmd_set_echo_cancel() {
+  local raw="${1:-}"
+  local on=1
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$raw" in
+    1|true|yes|on) on=1 ;;
+    0|false|no|off) on=0 ;;
+    *)
+      emit '{"ok":false,"error":"echo-cancel must be true or false"}'
+      return 1
+      ;;
+  esac
+  python3 - "$SETTINGS_FILE" "$on" <<'PY'
+import json, sys
+path, on = sys.argv[1], sys.argv[2] == "1"
+try:
+    data = json.load(open(path))
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+data["echoCancelMiracast"] = on
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, separators=(",", ":"))
+    f.write("\n")
+print(json.dumps({"ok": True, "echoCancelMiracast": on}, separators=(",", ":")))
+PY
+  if [[ "$on" = 1 ]]; then
+    ensure_miracast_aec || true
+    sync_miracast_audio_routes || true
+  else
+    teardown_miracast_aec || true
+  fi
+}
+
 # Merge sink-advertised stream modes + preferred/current into a status object.
 # Must use python3 -c (like enrich_peer_name) so stdin stays the JSON pipe.
 # A heredoc would steal stdin and wipe phase/running from status.
@@ -5675,6 +5758,7 @@ activate_miracast_audio_default() {
     pactl set-default-sink "$MIRACAST_AUDIO_SINK_NAME" 2>/dev/null || true
     echo "[miracast-ctl] default sink → miracast (streaming / PLAY)" >>"$LOG_DIR/cast.log"
   fi
+  ensure_miracast_aec || true
   sync_miracast_audio_routes || true
 }
 
@@ -5872,6 +5956,10 @@ for block in out.split("Sink Input #")[1:]:
         continue
     if media == "miracast" and "Lavf" in (app or ""):
         continue
+    if "Echo-Cancel" in (app or "") or "Echo-Cancel" in (media or ""):
+        continue
+    if "echo-cancel" in (app or "").lower() or "echo-cancel" in (media or "").lower():
+        continue
     if idx_to_name.get(sink_idx) != from_sink:
         continue
     r = subprocess.run(
@@ -6012,6 +6100,423 @@ print(",".join(moved))
 PY
 }
 
+# Analog (or USB) capture source currently in use — not a monitor, not Miracast.
+analog_mic_source() {
+  if [[ -f "$AUDIO_AEC_MIC_FILE" ]]; then
+    local saved
+    saved="$(tr -d '[:space:]' <"$AUDIO_AEC_MIC_FILE" 2>/dev/null || true)"
+    if [[ -n "$saved" ]] && pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qx "$saved"; then
+      echo "$saved"
+      return 0
+    fi
+  fi
+  python3 - <<'PY'
+import subprocess
+short = subprocess.check_output(["pactl", "list", "short", "sources"], text=True, errors="replace")
+names = []
+for row in short.splitlines():
+    parts = row.split()
+    if len(parts) >= 2:
+        names.append(parts[1])
+idx_to_name = {}
+for row in short.splitlines():
+    parts = row.split()
+    if len(parts) >= 2:
+        idx_to_name[parts[0]] = parts[1]
+
+def skip(n):
+    n = n or ""
+    if n.endswith(".monitor"):
+        return True
+    if "miracast" in n or "echo-cancel" in n or n.endswith("_aec"):
+        return True
+    return False
+
+# Prefer a live capture's source (Brave input on analog).
+try:
+    out = subprocess.check_output(["pactl", "list", "source-outputs"], text=True, errors="replace")
+except subprocess.CalledProcessError:
+    out = ""
+for block in out.split("Source Output #")[1:]:
+    src = app = ""
+    for line in block.splitlines():
+        s = line.strip()
+        if s.startswith("Source:"):
+            src = s.split(":", 1)[1].strip()
+        elif "application.name" in s and "=" in s:
+            app = s.split("=", 1)[-1].strip().strip('"')
+    if app == "fluxcast-wfd-capture" or "fluxcast" in (app or "").lower():
+        continue
+    name = idx_to_name.get(src, "")
+    if name and not skip(name):
+        print(name)
+        raise SystemExit(0)
+
+try:
+    defsrc = subprocess.check_output(["pactl", "get-default-source"], text=True, errors="replace").strip()
+except subprocess.CalledProcessError:
+    defsrc = ""
+if defsrc and not skip(defsrc):
+    print(defsrc)
+    raise SystemExit(0)
+for n in names:
+    if not skip(n):
+        print(n)
+        raise SystemExit(0)
+PY
+}
+
+cast_playback_sink() {
+  if pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$MIRACAST_AEC_SINK_NAME"; then
+    echo "$MIRACAST_AEC_SINK_NAME"
+  else
+    echo "$MIRACAST_AUDIO_SINK_NAME"
+  fi
+}
+
+is_cast_playback_sink() {
+  [[ "$1" == "$MIRACAST_AUDIO_SINK_NAME" || "$1" == "$MIRACAST_AEC_SINK_NAME" ]]
+}
+
+# Echo-Cancel Playback must hit sink_master (miracast), never analog speakers
+# and never the AEC sink (that loops).
+pin_aec_playback_to_miracast() {
+  pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$MIRACAST_AUDIO_SINK_NAME" || return 0
+  python3 - "$MIRACAST_AUDIO_SINK_NAME" <<'PY'
+import subprocess, sys
+target = sys.argv[1]
+short = subprocess.check_output(["pactl", "list", "short", "sinks"], text=True, errors="replace")
+idx_to_name = {row.split()[0]: row.split()[1] for row in short.splitlines() if len(row.split()) >= 2}
+out = subprocess.check_output(["pactl", "list", "sink-inputs"], text=True, errors="replace")
+moved = []
+for block in out.split("Sink Input #")[1:]:
+    lines = block.splitlines()
+    try:
+        idx = int(lines[0].strip().split()[0])
+    except (ValueError, IndexError):
+        continue
+    sink_idx = app = media = ""
+    for line in lines:
+        s = line.strip()
+        if s.startswith("Sink:"):
+            sink_idx = s.split(":", 1)[1].strip()
+        elif "application.name" in s and "=" in s:
+            app = s.split("=", 1)[-1].strip().strip('"')
+        elif "media.name" in s and "=" in s:
+            media = s.split("=", 1)[-1].strip().strip('"')
+    if "Echo-Cancel Playback" not in (media or "") and "Echo-Cancel Playback" not in (app or ""):
+        continue
+    if idx_to_name.get(sink_idx or "") == target:
+        continue
+    r = subprocess.run(["pactl", "move-sink-input", str(idx), target], capture_output=True, text=True)
+    if r.returncode == 0:
+        moved.append(str(idx))
+print(",".join(moved))
+PY
+}
+
+# Rewire analog-mic app captures onto the hidden AEC source. Do not use
+# pactl move-source-output (that would expose a second mic in the mixer).
+# Never mix the cancelled mic into WFD / monitor capture (pw-cat).
+pin_miracast_aec_capture() {
+  echo_cancel_miracast_on || return 0
+  local mic=""
+  mic="$(analog_mic_source || true)"
+  [[ -n "$mic" ]] || return 0
+  pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qx "$MIRACAST_AEC_SOURCE_NAME" || return 0
+  python3 - "$MIRACAST_AEC_SOURCE_NAME" "$mic" <<'PY'
+import json, subprocess, sys
+aec, mic = sys.argv[1], sys.argv[2]
+skip = (
+    "aec_cap", "echo-cancel", "fluxcast", "omarchy_speaker_tuning",
+    "pw-cat", "pw-record", "omaudix", "miracast-silence",
+)
+moved = []
+# Drop any leftover cancelled-mic → WFD links from older pin logic.
+for name in ("pw-cat", "pw-record"):
+    for ch in ("FL", "FR", "MONO"):
+        subprocess.run(
+            ["pw-link", "-d", f"{aec}:capture_{ch}", f"{name}:input_{ch}"],
+            capture_output=True,
+        )
+try:
+    data = json.loads(subprocess.check_output(["pw-dump"], text=True))
+except Exception:
+    raise SystemExit(0)
+for o in data:
+    p = (o.get("info") or {}).get("props") or {}
+    cls = str(p.get("media.class") or "")
+    if "Stream/Input/Audio" not in cls:
+        continue
+    name = str(p.get("node.name") or "")
+    app = str(p.get("application.name") or "")
+    role = str(p.get("media.role") or "")
+    cat = str(p.get("media.category") or "")
+    low = f"{name} {app}".lower()
+    if any(s in low for s in skip):
+        continue
+    if role.lower() == "abstract" or cat.lower() == "capture":
+        continue
+    if "fluxcast" in low or "wfd" in low:
+        continue
+    for ch in ("FL", "FR"):
+        dst = f"{name}:input_{ch}"
+        analog = f"{mic}:capture_{ch}"
+        subprocess.run(["pw-link", "-d", analog, dst], capture_output=True)
+        r = subprocess.run(
+            ["pw-link", f"{aec}:capture_{ch}", dst],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            moved.append(dst)
+print(",".join(moved))
+PY
+}
+
+aec_nodes_present() {
+  [[ -f "$AUDIO_AEC_PID_FILE" ]] && return 0
+  [[ -f "$AUDIO_AEC_PWCLI_PID_FILE" ]] && return 0
+  pgrep -f 'miracast_aec_holder.sh' >/dev/null 2>&1 && return 0
+  pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qx "$MIRACAST_AEC_SOURCE_NAME"
+}
+
+# pw-cli -m keeps libpipewire-module-echo-cancel loaded after the holder
+# script dies (stdin EOF does not quit monitor mode). Kill that client.
+kill_aec_pwcli_clients() {
+  local pid=""
+  if [[ -f "$AUDIO_AEC_PWCLI_PID_FILE" ]]; then
+    pid="$(tr -d '[:space:]' <"$AUDIO_AEC_PWCLI_PID_FILE" 2>/dev/null || true)"
+    rm -f "$AUDIO_AEC_PWCLI_PID_FILE"
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      sleep 0.1
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+  python3 - "$MIRACAST_AEC_SOURCE_NAME" <<'PY' >/dev/null || true
+import json, os, signal, subprocess, sys
+want = sys.argv[1]
+try:
+    data = json.loads(subprocess.check_output(["pw-dump"], text=True))
+except Exception:
+    raise SystemExit(0)
+clients = {}
+aec_clients = set()
+for o in data:
+    info = o.get("info") or {}
+    p = info.get("props") or {}
+    t = str(o.get("type") or "")
+    if "Client" in t:
+        clients[o.get("id")] = p
+        continue
+    name = str(p.get("node.name") or "")
+    if name in (want, "omarchy_speaker_tuning.aec_cap", "echo-cancel-sink") or "echo-cancel" in name:
+        cid = p.get("client.id")
+        if cid is not None:
+            aec_clients.add(cid)
+for cid in aec_clients:
+    p = clients.get(cid) or {}
+    if str(p.get("application.name") or "") != "pw-cli":
+        continue
+    raw = p.get("pipewire.sec.pid")
+    try:
+        os.kill(int(raw), signal.SIGTERM)
+    except (TypeError, ValueError, ProcessLookupError, PermissionError):
+        pass
+PY
+}
+
+# WirePlumber remembers AEC as the Brave (etc.) capture target. After the
+# module is gone those restores point at a missing source and new streams
+# never attach. Point them back at the analog mic.
+retarget_aec_stream_restore() {
+  local mic="${1:-}"
+  [[ -n "$mic" ]] || mic="$(analog_mic_source || true)"
+  python3 - "$mic" "$MIRACAST_AEC_SOURCE_NAME" "$MIRACAST_AEC_SINK_NAME" \
+    "${XDG_STATE_HOME:-$HOME/.local/state}/wireplumber/stream-properties" \
+    "${XDG_STATE_HOME:-$HOME/.local/state}/wireplumber/default-nodes" <<'PY' || true
+import json, os, re, sys
+mic, aec_src, aec_sink, streams, nodes = sys.argv[1:6]
+aec_names = {aec_src, aec_sink, "miracast_aec", "echo-cancel-sink"}
+if streams and os.path.isfile(streams):
+    out = []
+    changed = False
+    with open(streams, encoding="utf-8") as f:
+        for line in f:
+            raw = line.rstrip("\n")
+            if "=" in raw and raw.lstrip()[:1] != "[" and "target" in raw:
+                key, val = raw.split("=", 1)
+                try:
+                    data = json.loads(val)
+                except Exception:
+                    out.append(raw)
+                    continue
+                tgt = str(data.get("target") or "")
+                if tgt in aec_names or "miracast_aec" in tgt:
+                    if mic:
+                        data["target"] = mic
+                    else:
+                        data.pop("target", None)
+                    raw = f"{key}={json.dumps(data)}"
+                    changed = True
+            out.append(raw)
+    if changed:
+        tmp = streams + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        os.replace(tmp, streams)
+if nodes and os.path.isfile(nodes):
+    out = []
+    changed = False
+    with open(nodes, encoding="utf-8") as f:
+        for line in f:
+            raw = line.rstrip("\n")
+            if any(n and n in raw for n in aec_names):
+                changed = True
+                continue
+            out.append(raw)
+    if changed:
+        tmp = nodes + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        os.replace(tmp, nodes)
+PY
+}
+
+teardown_miracast_aec() {
+  # Drop cancelled-mic → WFD links before the source vanishes.
+  python3 - "$MIRACAST_AEC_SOURCE_NAME" <<'PY' >/dev/null || true
+import subprocess, sys
+aec = sys.argv[1]
+for name in ("pw-cat", "pw-record"):
+    for ch in ("FL", "FR", "MONO"):
+        subprocess.run(
+            ["pw-link", "-d", f"{aec}:capture_{ch}", f"{name}:input_{ch}"],
+            capture_output=True,
+        )
+PY
+  kill_aec_pwcli_clients || true
+  if [[ -f "$AUDIO_AEC_PID_FILE" ]]; then
+    local apid
+    apid="$(tr -d '[:space:]' <"$AUDIO_AEC_PID_FILE" 2>/dev/null || true)"
+    rm -f "$AUDIO_AEC_PID_FILE"
+    if [[ -n "$apid" ]]; then
+      kill "$apid" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$apid" 2>/dev/null || true
+    fi
+  fi
+  pkill -f 'miracast_aec_holder.sh' 2>/dev/null || true
+  rm -f "$AUDIO_AEC_FIFO" "$AUDIO_AEC_PWCLI_PID_FILE"
+  local mid=""
+  if [[ -f "$AUDIO_AEC_MODULE_FILE" ]]; then
+    mid="$(tr -d '[:space:]' <"$AUDIO_AEC_MODULE_FILE" 2>/dev/null || true)"
+    rm -f "$AUDIO_AEC_MODULE_FILE"
+  fi
+  rm -f "$AUDIO_AEC_MIC_FILE" "$AUDIO_PREV_SOURCE_FILE"
+  local cur_sink
+  cur_sink="$(pactl get-default-sink 2>/dev/null || true)"
+  if [[ "$cur_sink" == "$MIRACAST_AEC_SINK_NAME" ]]; then
+    if pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$MIRACAST_AUDIO_SINK_NAME"; then
+      pactl set-default-sink "$MIRACAST_AUDIO_SINK_NAME" 2>/dev/null || true
+    fi
+  fi
+  migrate_sink_inputs "$MIRACAST_AEC_SINK_NAME" "$MIRACAST_AUDIO_SINK_NAME" >/dev/null || true
+  if [[ -n "$mid" ]]; then
+    pactl unload-module "$mid" 2>/dev/null || true
+  fi
+  local line mod
+  while read -r line; do
+    printf '%s' "$line" | grep -q "sink_name=$MIRACAST_AEC_SINK_NAME" || continue
+    mod="${line%%$'\t'*}"
+    mod="${mod%% *}"
+    [[ -n "$mod" ]] && pactl unload-module "$mod" 2>/dev/null || true
+  done < <(pactl list short modules 2>/dev/null || true)
+  retarget_aec_stream_restore || true
+  echo "[miracast-ctl] echo-cancel torn down" >>"$LOG_DIR/cast.log" 2>/dev/null || true
+}
+
+# Monitor-mode AEC: reference is the default sink's monitor (Miracast when
+# that is the speaker). Apps keep playing to Miracast and capturing the
+# analog mic in the UI; we pin those captures onto a hidden cancelled
+# source. No extra output device. Off via settings.echoCancelMiracast or
+# MIRACAST_AEC=0.
+ensure_miracast_aec() {
+  if ! echo_cancel_miracast_on; then
+    if aec_nodes_present; then
+      teardown_miracast_aec || true
+    fi
+    return 0
+  fi
+  [[ -f "$AUDIO_DEFAULT_HOLD_FILE" ]] && return 0
+  pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$MIRACAST_AUDIO_SINK_NAME" || return 0
+
+  local mic=""
+  mic="$(analog_mic_source || true)"
+  [[ -n "$mic" ]] || return 0
+  printf '%s\n' "$mic" >"$AUDIO_AEC_MIC_FILE"
+
+  local existing=""
+  existing="$(pgrep -f 'miracast_aec_holder.sh' | head -1 || true)"
+  local pwcli=""
+  [[ -f "$AUDIO_AEC_PWCLI_PID_FILE" ]] && pwcli="$(tr -d '[:space:]' <"$AUDIO_AEC_PWCLI_PID_FILE" 2>/dev/null || true)"
+  if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null \
+     && [[ -n "$pwcli" ]] && kill -0 "$pwcli" 2>/dev/null \
+     && pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qx "$MIRACAST_AEC_SOURCE_NAME"; then
+    echo "$existing" >"$AUDIO_AEC_PID_FILE"
+    pin_miracast_aec_capture >/dev/null || true
+    return 0
+  fi
+  # Holder gone but pw-cli still holding the module: drop it before reload.
+  if aec_nodes_present; then
+    teardown_miracast_aec || true
+  fi
+
+  # Drop the old Pulse AEC sink wrap if it is still around.
+  if [[ -f "$AUDIO_AEC_MODULE_FILE" ]] || pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$MIRACAST_AEC_SINK_NAME"; then
+    local oldmid=""
+    [[ -f "$AUDIO_AEC_MODULE_FILE" ]] && oldmid="$(tr -d '[:space:]' <"$AUDIO_AEC_MODULE_FILE" 2>/dev/null || true)"
+    rm -f "$AUDIO_AEC_MODULE_FILE"
+    migrate_sink_inputs "$MIRACAST_AEC_SINK_NAME" "$MIRACAST_AUDIO_SINK_NAME" >/dev/null || true
+    local cur
+    cur="$(pactl get-default-sink 2>/dev/null || true)"
+    if [[ "$cur" == "$MIRACAST_AEC_SINK_NAME" ]]; then
+      pactl set-default-sink "$MIRACAST_AUDIO_SINK_NAME" 2>/dev/null || true
+    fi
+    cur="$(pactl get-default-source 2>/dev/null || true)"
+    if [[ "$cur" == "miracast_aec" || "$cur" == "$MIRACAST_AEC_SOURCE_NAME" ]]; then
+      pactl set-default-source "$mic" 2>/dev/null || true
+    fi
+    [[ -n "$oldmid" ]] && pactl unload-module "$oldmid" 2>/dev/null || true
+  fi
+
+  local script="$PLUGIN_DIR/scripts/miracast_aec_holder.sh"
+  [[ -f "$script" ]] || {
+    echo "[miracast-ctl] AEC holder script missing" >>"$LOG_DIR/cast.log"
+    return 1
+  }
+  chmod +x "$script" 2>/dev/null || true
+  nohup bash "$script" "$mic" >/dev/null 2>&1 &
+  local hpid=$!
+  echo "$hpid" >"$AUDIO_AEC_PID_FILE"
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if pw-link -o 2>/dev/null | grep -q "^${MIRACAST_AEC_SOURCE_NAME}:"; then
+      break
+    fi
+    sleep 0.15
+  done
+  if ! pw-link -o 2>/dev/null | grep -q "^${MIRACAST_AEC_SOURCE_NAME}:"; then
+    echo "[miracast-ctl] echo-cancel source did not appear (mic=$mic)" >>"$LOG_DIR/cast.log"
+    return 1
+  fi
+  echo "[miracast-ctl] echo-cancel monitor.mode holder=$hpid mic=$mic" >>"$LOG_DIR/cast.log"
+  pin_miracast_aec_capture >/dev/null || true
+  pin_miracast_silence_feeder >/dev/null || true
+  pin_miracast_audio_capture >/dev/null || true
+  return 0
+}
+
 sync_miracast_audio_routes() {
   # Before PLAY: keep speakers as default even if WirePlumber prefers Miracast.
   if [[ -f "$AUDIO_DEFAULT_HOLD_FILE" ]]; then
@@ -6035,31 +6540,47 @@ sync_miracast_audio_routes() {
     return 0
   fi
 
-  if [[ "$def" == "$MIRACAST_AUDIO_SINK_NAME" ]]; then
-    # Default is Miracast: always pull app streams onto it (not only when the
-    # default *changes*). Gating on last!=def skipped migrates when last-default
-    # was stale, leaving Brave etc. on speakers while Miracast was selected.
+  ensure_miracast_aec || true
+  def="$(pactl get-default-sink 2>/dev/null || true)"
+  local play="$MIRACAST_AUDIO_SINK_NAME"
+
+  if is_cast_playback_sink "$def"; then
+    # User-facing output is Miracast. Do not steal the default to an AEC sink.
+    if [[ "$def" == "$MIRACAST_AEC_SINK_NAME" ]]; then
+      pactl set-default-sink "$MIRACAST_AUDIO_SINK_NAME" 2>/dev/null || true
+      def="$MIRACAST_AUDIO_SINK_NAME"
+      printf '%s\n' "$def" >"$AUDIO_ROUTE_LAST_DEFAULT_FILE"
+    fi
     local s moved any=""
     for s in $(pactl list short sinks 2>/dev/null | awk '{print $2}'); do
-      [[ "$s" == "$MIRACAST_AUDIO_SINK_NAME" ]] && continue
-      moved="$(migrate_sink_inputs "$s" "$MIRACAST_AUDIO_SINK_NAME" || true)"
+      [[ "$s" == "$play" ]] && continue
+      moved="$(migrate_sink_inputs "$s" "$play" || true)"
       if [[ -n "$moved" ]]; then
         any=1
-        echo "[miracast-ctl] audio route → miracast (from $s): $moved" >>"$LOG_DIR/cast.log"
+        echo "[miracast-ctl] audio route → $play (from $s): $moved" >>"$LOG_DIR/cast.log"
       fi
     done
     if [[ -z "$any" && "$last" != "$def" ]]; then
-      echo "[miracast-ctl] audio route → miracast: nothing to move" >>"$LOG_DIR/cast.log"
+      echo "[miracast-ctl] audio route → $play: nothing to move" >>"$LOG_DIR/cast.log"
     fi
   else
-    # Default is not Miracast: move app streams off Miracast onto the default.
+    # Default is not the cast path: move app streams off Miracast/AEC.
     local moved
+    moved="$(migrate_sink_inputs "$MIRACAST_AEC_SINK_NAME" "$def" || true)"
+    if [[ -n "$moved" ]]; then
+      echo "[miracast-ctl] audio route $MIRACAST_AEC_SINK_NAME → $def: $moved" >>"$LOG_DIR/cast.log"
+    fi
     moved="$(migrate_sink_inputs "$MIRACAST_AUDIO_SINK_NAME" "$def" || true)"
     if [[ -n "$moved" || "$last" != "$def" ]]; then
       echo "[miracast-ctl] audio route miracast → $def: ${moved:-none}" >>"$LOG_DIR/cast.log"
     fi
   fi
 
+  local aec_play
+  aec_play="$(pin_aec_playback_to_miracast || true)"
+  if [[ -n "$aec_play" ]]; then
+    echo "[miracast-ctl] echo-cancel playback $aec_play → miracast" >>"$LOG_DIR/cast.log"
+  fi
   # Silence feeder must always stay on Miracast for capture.
   local pinned
   pinned="$(pin_miracast_silence_feeder || true)"
@@ -6071,6 +6592,13 @@ sync_miracast_audio_routes() {
   cap_pinned="$(pin_miracast_audio_capture || true)"
   if [[ -n "$cap_pinned" ]]; then
     echo "[miracast-ctl] audio capture $cap_pinned → miracast.monitor" >>"$LOG_DIR/cast.log"
+  fi
+  if echo_cancel_miracast_on; then
+    local aec_pinned
+    aec_pinned="$(pin_miracast_aec_capture || true)"
+    if [[ -n "$aec_pinned" ]]; then
+      echo "[miracast-ctl] mic capture $aec_pinned → $MIRACAST_AEC_SOURCE_NAME" >>"$LOG_DIR/cast.log"
+    fi
   fi
   return 0
 }
@@ -6218,6 +6746,7 @@ start_miracast_audio_route_watcher() {
   # cannot leave pactl|bash orphans that look like hung starts.
   set -m
   MIRACAST_AUDIO_SINK_NAME="$MIRACAST_AUDIO_SINK_NAME" \
+  MIRACAST_AEC_SINK_NAME="$MIRACAST_AEC_SINK_NAME" \
     nohup bash "$script" "$PLUGIN_DIR/bin/miracast-ctl" >/dev/null 2>&1 &
   local wpid=$!
   set +m
@@ -6377,22 +6906,23 @@ teardown_miracast_audio_sink() {
   stop_miracast_audio_route_watcher || true
   stop_miracast_link_watcher || true
   rm -f "$AUDIO_DEFAULT_HOLD_FILE"
+  teardown_miracast_aec || true
 
   # Prefer the sink we remembered from before PLAY / before Miracast default.
   local dest=""
   if [[ -f "$AUDIO_PREV_DEFAULT_FILE" ]]; then
     dest="$(tr -d '[:space:]' <"$AUDIO_PREV_DEFAULT_FILE" 2>/dev/null || true)"
   fi
-  if [[ -z "$dest" || "$dest" == "$MIRACAST_AUDIO_SINK_NAME" ]]; then
+  if [[ -z "$dest" || "$dest" == "$MIRACAST_AUDIO_SINK_NAME" || "$dest" == "$MIRACAST_AEC_SINK_NAME" ]]; then
     dest="$(pactl get-default-sink 2>/dev/null || true)"
   fi
-  if [[ -z "$dest" || "$dest" == "$MIRACAST_AUDIO_SINK_NAME" ]]; then
-    dest="$(pactl list short sinks 2>/dev/null | awk -v m="$MIRACAST_AUDIO_SINK_NAME" '$2!=m{print $2; exit}')"
+  if [[ -z "$dest" || "$dest" == "$MIRACAST_AUDIO_SINK_NAME" || "$dest" == "$MIRACAST_AEC_SINK_NAME" ]]; then
+    dest="$(pactl list short sinks 2>/dev/null | awk -v m="$MIRACAST_AUDIO_SINK_NAME" -v a="$MIRACAST_AEC_SINK_NAME" '$2!=m && $2!=a{print $2; exit}')"
   fi
-  if [[ -n "$dest" && "$dest" != "$MIRACAST_AUDIO_SINK_NAME" ]]; then
+  if [[ -n "$dest" && "$dest" != "$MIRACAST_AUDIO_SINK_NAME" && "$dest" != "$MIRACAST_AEC_SINK_NAME" ]]; then
     local cur
     cur="$(pactl get-default-sink 2>/dev/null || true)"
-    if [[ "$cur" == "$MIRACAST_AUDIO_SINK_NAME" ]]; then
+    if [[ "$cur" == "$MIRACAST_AUDIO_SINK_NAME" || "$cur" == "$MIRACAST_AEC_SINK_NAME" ]]; then
       pactl set-default-sink "$dest" 2>/dev/null || true
       echo "[miracast-ctl] default sink restored → $dest" >>"$LOG_DIR/cast.log" 2>/dev/null || true
     fi
@@ -7454,6 +7984,8 @@ Commands:
   set-persist-display true|false    # Persist display across monitors (shared persistent-miracast head)
   set-preserve-display true|false   # alias of set-persist-display
   set-auto-switch-audio true|false  # Automatically switch audio output at PLAY
+  get-echo-cancel
+  set-echo-cancel true|false        # Subtract Miracast/TV from the analog mic
   set-best-lock true|false          # Lock Best fine-step (freeze current QP/bitrate)
   get-stream-mode
   set-stream-mode [--abr] <id>   # e.g. 1280x720p30 / 1920x1080p60; --abr keeps preferred
@@ -7806,6 +8338,8 @@ main() {
     set-mode|set_mode) cmd_set_mode "$@" ;;
     set-persist-display|set_persist_display|set-preserve-display|set_preserve_display) cmd_set_preserve_display "$@" ;;
     set-auto-switch-audio|set_auto_switch_audio) cmd_set_auto_switch_audio "$@" ;;
+    get-echo-cancel|get_echo_cancel) cmd_get_echo_cancel "$@" ;;
+    set-echo-cancel|set_echo_cancel) cmd_set_echo_cancel "$@" ;;
     set-best-lock|set_best_lock) cmd_set_best_lock "$@" ;;
     get-stream-mode|get_stream_mode) cmd_get_stream_mode "$@" ;;
     set-stream-mode|set_stream_mode) cmd_set_stream_mode "$@" ;;
