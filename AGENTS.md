@@ -33,9 +33,9 @@ Keep this file short. Depth lives in the docs below — link, don’t paste.
 - **Plugin id** is `realchrisolin.display` (not `colin.display` / not stock `omarchy.monitor`).
 - **Privacy in logs / commits / public benches:** scrub SSIDs and MACs; use the sanitize helpers when publishing benchmarks.
 
-## v2 Display (`main`)
+## v2 Display (`master`)
 
-kris-1 monitor-layout is vendored on `main` (`Arrangement.qml`, `LayoutService.qml`,
+kris-1 monitor-layout is vendored on `master` (`Arrangement.qml`, `LayoutService.qml`,
 `LayoutModel.js`; SHA in `docs/UPSTREAM-monitor-layout.txt`). Contract: `docs/V2.md`.
 Bar entry is `DisplayPanel.qml` (layout + `MiracastSection.qml`). Virtual heads must stay out of Arrangement.
 Bar widgets are copied per screen; only `Quickshell.screens[0]` owns `IpcHandler` and layout apply (`singletonOwner`). QML IPC changes need `omarchy restart shell`.
