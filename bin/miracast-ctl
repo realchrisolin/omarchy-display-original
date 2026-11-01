@@ -470,7 +470,7 @@ defaults = {
     "lastPeerMac": "",
     "lastPeerName": "",
     "fps": "20",
-    "bitrate": "8M",
+    "bitrate": "14M",
     "outputRes": "1280x720",
     "extendResolution": "1280x720",
     # auto | vaapi | qsv | software — FluxCast reads FLUXCAST_WFD_ENCODER.
@@ -501,9 +501,8 @@ defaults = {
     # Default Hyprland scale for Miracast Extend when sinkScales has no MAC entry.
     # 1 minimizes compositor cost; raise per-sink via the Display panel if needed.
     "defaultExtendScale": 1,
-    # Virtual output refresh (Hz). Default 30 to match stream fps — keeps ICC
-    # capture from outrunning the encoder (large buffer queues = lag).
-    "extendRefresh": 30,
+    # Virtual output refresh (Hz). Follow stream fps (1080p60 → 60).
+    "extendRefresh": 60,
     # Force software cursors so the pointer is visible on the TV (screencopy
     # cannot see the HW cursor plane).
     "softwareCursors": True,
@@ -513,9 +512,9 @@ defaults = {
     # auto | icc | wlr — see resolve_wf_recorder_env. Empty treated as auto.
     # icc with a missing/non-ICC binary falls back to PATH (fail-soft).
     "wfRecorderProto": "auto",
-    # "1" | "0" — omit wf-recorder -D when "1" (damage-aware). From
-    # scripts/recommend-cast-profile.py --apply or manual override.
-    "wfRecorderDamage": "1",
+    # "1" | "0" — omit wf-recorder -D when "1" (damage-aware). Default "0"
+    # = continuous frames (needed for idle UI / bar ticker).
+    "wfRecorderDamage": "0",
     # DMA-BUF CQP quantizer for h264_vaapi (lower = sharper / more bitrate).
     "vaapiQp": 18,
     # VAAPI GOP length in frames (default = stream fps ≈ 1s). Shorter recovers
@@ -524,23 +523,24 @@ defaults = {
     # desktop | movie — see apply_cast_preset / set-cast-preset.
     "castPreset": "desktop",
     # Encoding strategy (orthogonal to RENDER ENGINE / PRESET QUALITY):
-    # smartview = QVBR + BitrateController (try DMA-BUF, fall back to pipe on starve);
-    # performance = DMA-BUF + CQP (Best uses QP ladder, no QVBR bitrate churn).
+    # smartview = BitrateController on CBR (AOSP WFD; Intel QVBR idle-UI
+    # undershoots). Try DMA-BUF, fall back to pipe on starve.
+    # performance = DMA-BUF + CQP (Best uses QP ladder, no bitrate churn).
     "encodeStrategy": "smartview",
     "encodeStrategyFallback": "",
     "encodeStrategyAbr": "sv",
     "encodeStrategyPinnedEngine": False,
-    # CQP | CBR | VBR — FluxCast FLUXCAST_WFD_VAAPI_RC
-    "vaapiRcMode": "CQP",
-    # CBR/VBR target (e.g. 12M); ignored for CQP.
-    "vaapiBitrate": "12M",
-    # ffmpeg h264_vaapi -quality (1–8; higher = faster/worse). Default 5.
-    "vaapiQuality": "5",
+    # CQP | CBR | VBR | QVBR — FluxCast FLUXCAST_WFD_VAAPI_RC
+    "vaapiRcMode": "CBR",
+    # CBR/VBR target (e.g. 14M); ignored for CQP.
+    "vaapiBitrate": "14M",
+    # ffmpeg h264_vaapi -quality (1–8; higher = faster/worse). Default 3.
+    "vaapiQuality": "3",
     # CQP I-frame qfactor (1.0 = same as P; >1 = coarser I → lower IDR spikes).
     "vaapiIQfactor": "1.0",
     # FLUXCAST_WFD_VBV_MULTIPLIER — VBV as fraction of bitrate (~seconds).
-    # smartview/QVBR uses 2.0 (Intel QVBR underspends at 0.25 s); CQP keeps 0.5.
-    "vbvMultiplier": "2.0",
+    # CBR/smartview: Intel low-delay 0.25 s. CQP keeps 0.5.
+    "vbvMultiplier": "0.25",
     # Post-PLAY CSA to a quiet channel (MCC). Default false = SCC: radio A/B
     # showed 0 retry spikes on SCC vs 10 on MCC bw20.
     "p2pQuietCsa": False,
@@ -766,11 +766,12 @@ import json, re
 from pathlib import Path
 p = Path(__import__("sys").argv[1])
 d = json.loads(p.read_text())
-d["vaapiRcMode"] = "QVBR"
+d["vaapiRcMode"] = "CBR"
 d.setdefault("vaapiQp", 22)
 d.setdefault("encodeQpMin", 15)
 d.setdefault("encodeQpMax", 44)
-br = str(d.get("vaapiBitrate") or d.get("bitrate") or "20M")
+d["vbvMultiplier"] = str(d.get("vbvMultiplier") or "0.25")
+br = str(d.get("vaapiBitrate") or d.get("bitrate") or "14M")
 d["bitrate"] = br
 d["vaapiBitrate"] = br
 m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*([KkMm])?", br)
@@ -4442,16 +4443,16 @@ elif enc in ("libx264", "software"):
 
 legacy = {"dmabuf": "vaapi", "vaapi": "pipe", "cpu": "pipe"}[cap]
 profile = str(settings.get("encodeProfile") or "").strip().lower()
-rc = str(settings.get("vaapiRcMode") or "CQP").strip().upper() or "CQP"
+rc = str(settings.get("vaapiRcMode") or "CBR").strip().upper() or "CBR"
 qp = str(settings.get("vaapiQp") if settings.get("vaapiQp") is not None else "18").strip() or "18"
 gop = str(settings.get("vaapiGop") if settings.get("vaapiGop") is not None else "60").strip() or "60"
-br = str(settings.get("vaapiBitrate") or settings.get("bitrate") or "12M").strip() or "12M"
+br = str(settings.get("vaapiBitrate") or settings.get("bitrate") or "14M").strip() or "14M"
 stream_br = str(settings.get("bitrate") or br).strip() or br
-qual = str(settings.get("vaapiQuality") or "5").strip() or "5"
+qual = str(settings.get("vaapiQuality") or "3").strip() or "3"
 async_d = str(settings.get("vaapiAsyncDepth") or "2").strip() or "2"
 iqf = str(settings.get("vaapiIQfactor") or "").strip()
-vbv = str(settings.get("vbvMultiplier") or "0.5").strip() or "0.5"
-dmg = str(settings.get("wfRecorderDamage", "1")).strip() or "1"
+vbv = str(settings.get("vbvMultiplier") or "0.25").strip() or "0.25"
+dmg = str(settings.get("wfRecorderDamage", "0")).strip() or "0"
 
 def _mbps(text: str) -> float:
     m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*([KkMm])?", str(text or ""))
@@ -4471,9 +4472,9 @@ def _fmt(mbps: float) -> str:
 # Smart View strategy + Best: QVBR (CAC-in-VBR) with hard maxrate = target.
 # Performance strategy keeps CQP even when encodeProfile=best (QP ladder ABR).
 if profile == "best" and strategy == "smartview" and cap in ("vaapi", "dmabuf", "cpu"):
-    rc = str(settings.get("vaapiRcMode") or "QVBR").strip().upper() or "QVBR"
+    rc = str(settings.get("vaapiRcMode") or "CBR").strip().upper() or "CBR"
     if rc not in ("QVBR", "CBR", "VBR"):
-        rc = "QVBR"
+        rc = "CBR"
     async_d = "1" if cap == "vaapi" else "1"
     # quality 1–2 can hang the pipe; quality ≥5 starves DMA-BUF QVBR bits.
     try:
@@ -6669,13 +6670,13 @@ else:
     # Rate control: settings.vaapiRcMode (CQP|QVBR|CBR|VBR) + bitrate for non-CQP.
     _rc="$(python3 -c 'import json,sys
 s=json.loads(sys.argv[1])
-print(str(s.get("vaapiRcMode") or "CQP").strip().upper() or "CQP")
+print(str(s.get("vaapiRcMode") or "CBR").strip().upper() or "CBR")
 ' "$settings" 2>/dev/null || echo CQP)"
     export FLUXCAST_WFD_VAAPI_RC="$_rc"
     _br="$(python3 -c 'import json,sys
 s=json.loads(sys.argv[1])
-print(str(s.get("vaapiBitrate") or "12M").strip() or "12M")
-' "$settings" 2>/dev/null || echo 12M)"
+print(str(s.get("vaapiBitrate") or "14M").strip() or "14M")
+' "$settings" 2>/dev/null || echo 14M)"
     export FLUXCAST_WFD_VAAPI_BITRATE="$_br"
     # Settings default; pre-set FLUXCAST_WFD_VAAPI_QUALITY wins (A/B tests).
     # Default 5: pipe A/B — q2 choppier; q7+tight VBV stalled.
@@ -7216,10 +7217,10 @@ for k in (
     if k in data:
         data.pop(k, None)
         changed = True
-# Prefer Smart View–style QVBR (CAC/VBR) for Best.
+# Prefer CBR for Best (AOSP WFD; Intel QVBR idle-UI undershoots).
 if str(data.get("encodeProfile") or "").lower() == "best":
     if data.get("vaapiRcMode") not in ("QVBR", "CBR", "VBR"):
-        data["vaapiRcMode"] = "QVBR"
+        data["vaapiRcMode"] = "CBR"
         changed = True
 if changed:
     p.write_text(json.dumps(data, indent=2) + "\n")
@@ -7521,7 +7522,10 @@ br = fmt(kbps)
 data["encodeStrategy"] = "smartview"
 data["encodeStrategyAbr"] = "sv"
 data["encodeProfile"] = data.get("encodeProfile") or "best"
-data["vaapiRcMode"] = "QVBR"
+rc = str(data.get("vaapiRcMode") or "CBR").strip().upper()
+if rc not in ("QVBR", "CBR", "VBR"):
+    rc = "CBR"
+data["vaapiRcMode"] = rc
 data["bitrate"] = br
 data["vaapiBitrate"] = br
 data["encodeWfdBitrateMbps"] = round(kbps / 1000.0, 3)
@@ -7542,7 +7546,7 @@ if not qp and data.get("encodeQpMin") and data.get("encodeQpMax"):
 elif not data.get("vaapiQp"):
     data["vaapiQp"] = 22
 path.write_text(json.dumps(data, indent=2) + "\n")
-print(json.dumps({"ok": True, "kbps": kbps, "bitrate": br, "rc": "QVBR", "qp": data.get("vaapiQp")}))
+print(json.dumps({"ok": True, "kbps": kbps, "bitrate": br, "rc": rc, "qp": data.get("vaapiQp")}))
 PY
   )" || {
     emit '{"ok":false,"error":"set-bitrate-kbps failed"}'
@@ -7591,7 +7595,10 @@ if cur <= 0:
     cur = 10.0
 nxt = max(floor_mbps, min(20.0, cur * factor))
 data["encodeProfile"] = data.get("encodeProfile") or "best"
-data["vaapiRcMode"] = "QVBR"
+rc = str(data.get("vaapiRcMode") or "CBR").strip().upper()
+if rc not in ("QVBR", "CBR", "VBR"):
+    rc = "CBR"
+data["vaapiRcMode"] = rc
 data["bitrate"] = fmt(nxt)
 data["vaapiBitrate"] = fmt(nxt)
 data["encodeWfdBitrateMbps"] = round(nxt, 3)
@@ -7603,7 +7610,7 @@ if int(str(data.get("vaapiQuality") or "5")) < 3:
 if not data.get("vaapiQp"):
     data["vaapiQp"] = 22
 path.write_text(json.dumps(data, indent=2) + "\n")
-print(json.dumps({"ok": True, "fromMbps": cur, "toMbps": nxt, "bitrate": fmt(nxt), "rc": "QVBR"}))
+print(json.dumps({"ok": True, "fromMbps": cur, "toMbps": nxt, "bitrate": fmt(nxt), "rc": rc}))
 PY
   )" || {
     emit '{"ok":false,"error":"congestion-cut failed"}'

@@ -385,7 +385,7 @@ function miracastEncodeProfileValues() {
   return ["best", "veryhigh", "high", "medium", "low"]
 }
 
-/** Encoding strategy: Smart View QVBR (default) vs DMA-BUF CQP performance. */
+/** Encoding strategy: Smart View CBR+ABR (default) vs DMA-BUF CQP performance. */
 function miracastEncodeStrategyValues() {
   return ["smartview", "performance"]
 }

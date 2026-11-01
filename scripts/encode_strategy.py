@@ -3,9 +3,11 @@
 
 Orthogonal to RENDER ENGINE (`captureEncode`) and PRESET QUALITY (`encodeProfile`).
 
-* ``smartview`` — QVBR + BitrateController (Samsung dig 2/8/14 Mbps, QP 15–44);
-  prefer DMA-BUF via ``prepare_dmabuf_settings``; pipe only on true starve
-  (air TX ≪ ~2.5 Mbps absolute).
+* ``smartview`` — BitrateController (Samsung dig 2/8/14 Mbps, QP 15–44) on
+  **CBR** (AOSP WFD / Intel idle-UI). QVBR undershoots on a still desktop so
+  cursor and the bar ticker block-encode. Prefer DMA-BUF via
+  ``prepare_dmabuf_settings``; pipe only on true starve
+  (air TX ≪ ~2.5 Mbps absolute). Set ``vaapiRcMode=QVBR`` to opt back in.
 * ``performance`` — DMA-BUF + CQP; Best uses the QP ladder, not set-bitrate QVBR.
 """
 
@@ -35,6 +37,11 @@ def bitrate_to_mbps(text: Any) -> float:
 # Seconds cap for HRD. FluxCast sizes bufsize from ~4 frames inside this cap
 # so QVBR undershoot cannot turn 0.25 s of peak into many seconds of delay.
 QVBR_VBV_MULTIPLIER = 0.1
+# Interactive Smart View default (kenya/hotyeah): CBR + Intel low-delay HRD.
+SMARTVIEW_RC_MODE = "CBR"
+SMARTVIEW_VBV_MULTIPLIER = "0.25"
+SMARTVIEW_BITRATE = "14M"
+SMARTVIEW_BITRATE_MBPS = 14.0
 # 1.0 = I-frames same quantizer as P. CQP High's 1.3 coarsens IDR and leaked
 # into QVBR via encodeProfileEffective=high.
 QVBR_I_QFACTOR = "1.0"
@@ -107,9 +114,9 @@ def prepare_dmabuf_settings(settings: dict[str, Any]) -> dict[str, Any]:
     settings["encodeStrategyFallback"] = ""
     if strat == "smartview":
         settings["vaapiIQfactor"] = QVBR_I_QFACTOR
-        rc = str(settings.get("vaapiRcMode") or "QVBR").strip().upper()
+        rc = str(settings.get("vaapiRcMode") or SMARTVIEW_RC_MODE).strip().upper()
         if rc not in ("QVBR", "CBR", "VBR"):
-            rc = "QVBR"
+            rc = SMARTVIEW_RC_MODE
         settings["vaapiRcMode"] = rc
     if strat == "smartview" and not settings.get("encodeStrategyPinnedEngine"):
         settings["captureEncode"] = "dmabuf"
@@ -123,10 +130,10 @@ def prepare_dmabuf_settings(settings: dict[str, Any]) -> dict[str, Any]:
         settings.setdefault("vaapiQp", 22)
         settings.setdefault("encodeQpMin", 15)
         settings.setdefault("encodeQpMax", 44)
-        settings.setdefault("bitrate", "8M")
-        settings.setdefault("vaapiBitrate", settings.get("bitrate") or "8M")
+        settings.setdefault("bitrate", SMARTVIEW_BITRATE)
+        settings.setdefault("vaapiBitrate", settings.get("bitrate") or SMARTVIEW_BITRATE)
         if settings.get("encodeWfdBitrateMbps") is None:
-            settings["encodeWfdBitrateMbps"] = 8.0
+            settings["encodeWfdBitrateMbps"] = SMARTVIEW_BITRATE_MBPS
         settings["vaapiAsyncDepth"] = 1
         sm = str(settings.get("streamMode") or "")
         one_sec = 30 if ("p30" in sm and "p60" not in sm) else 60
@@ -182,9 +189,9 @@ def apply_to_settings(
     settings["encodeStrategyPinnedEngine"] = False
 
     if strat == "smartview":
-        settings["vaapiRcMode"] = "QVBR"
+        settings["vaapiRcMode"] = SMARTVIEW_RC_MODE
         settings["vaapiAsyncDepth"] = 1
-        # Pipe hang floor is quality≥3; DMA-BUF QVBR also needs a low quality
+        # Pipe hang floor is quality≥3; DMA-BUF also needs a low quality
         # index (faster=higher starves bits — quality=7 delivered ~4 Mbps).
         try:
             q = int(str(settings.get("vaapiQuality") or "3"))
@@ -199,12 +206,12 @@ def apply_to_settings(
         if settings.get("vaapiQp") is None:
             settings["vaapiQp"] = 22
         if not str(settings.get("bitrate") or "").strip():
-            settings["bitrate"] = "8M"
+            settings["bitrate"] = SMARTVIEW_BITRATE
         if not str(settings.get("vaapiBitrate") or "").strip():
-            settings["vaapiBitrate"] = settings.get("bitrate") or "8M"
+            settings["vaapiBitrate"] = settings.get("bitrate") or SMARTVIEW_BITRATE
         if settings.get("encodeWfdBitrateMbps") is None:
-            settings["encodeWfdBitrateMbps"] = 8.0
-        settings["vbvMultiplier"] = f"{QVBR_VBV_MULTIPLIER:g}"
+            settings["encodeWfdBitrateMbps"] = SMARTVIEW_BITRATE_MBPS
+        settings["vbvMultiplier"] = SMARTVIEW_VBV_MULTIPLIER
         settings["vaapiIQfactor"] = QVBR_I_QFACTOR
         if retarget_engine and not settings.get("encodeStrategyPinnedEngine"):
             # Attempt DMA-BUF first; starve watchdog may flip to vaapi.

@@ -15,17 +15,17 @@ _spec.loader.exec_module(es)
 
 
 class EncodeStrategyTest(unittest.TestCase):
-    def test_smartview_defaults_dmabuf_qvbr(self):
+    def test_smartview_defaults_dmabuf_cbr(self):
         s: dict = {"encodeProfile": "best"}
         out = es.apply_to_settings(s, "smartview")
         self.assertEqual(out["encodeStrategy"], "smartview")
         self.assertEqual(s["captureEncode"], "dmabuf")
-        self.assertEqual(s["vaapiRcMode"], "QVBR")
+        self.assertEqual(s["vaapiRcMode"], "CBR")
         self.assertEqual(s["encodeStrategyAbr"], "sv")
-        self.assertEqual(s["bitrate"], "8M")
-        self.assertEqual(s["vaapiBitrate"], "8M")
-        self.assertEqual(s["encodeWfdBitrateMbps"], 8.0)
-        self.assertEqual(s["vbvMultiplier"], "0.1")
+        self.assertEqual(s["bitrate"], "14M")
+        self.assertEqual(s["vaapiBitrate"], "14M")
+        self.assertEqual(s["encodeWfdBitrateMbps"], 14.0)
+        self.assertEqual(s["vbvMultiplier"], "0.25")
         self.assertEqual(s["vaapiIQfactor"], "1.0")
         self.assertTrue(es.uses_sv_abr(s))
 
@@ -79,11 +79,11 @@ class EncodeStrategyTest(unittest.TestCase):
         self.assertEqual(s["encodeStrategyFallback"], "")
         self.assertEqual(s["captureEncode"], "dmabuf")
         self.assertEqual(out["captureEncode"], "dmabuf")
-        self.assertEqual(s["vaapiRcMode"], "QVBR")
-        self.assertEqual(s["bitrate"], "8M")
-        self.assertEqual(s["encodeWfdBitrateMbps"], 8.0)
+        self.assertEqual(s["vaapiRcMode"], "CBR")
+        self.assertEqual(s["bitrate"], "14M")
+        self.assertEqual(s["encodeWfdBitrateMbps"], 14.0)
         self.assertEqual(s["vaapiGop"], 60)
-        self.assertEqual(s["vbvMultiplier"], "0.1")
+        self.assertEqual(s["vbvMultiplier"], "0.25")
         self.assertEqual(s["vaapiIQfactor"], "1.0")
 
     def test_prepare_clears_cqp_high_iqfactor_when_pinned(self):
