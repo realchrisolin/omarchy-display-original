@@ -3,9 +3,11 @@
 Extends the Omarchy **Display** bar panel (brightness, text size, scale,
 per-output controls) with **Miracast / Wi‑Fi Display** mirror and extend.
 
-Branch **`v2-dev`** vendors [kris-1/omarchy-monitor-layout](https://github.com/kris-1/omarchy-monitor-layout)
+Default branch **`main`** vendors [kris-1/omarchy-monitor-layout](https://github.com/kris-1/omarchy-monitor-layout)
 (drag-and-drop arrangement) and hosts Miracast in `MiracastSection.qml`. See
-[`docs/V2.md`](docs/V2.md). `master` still uses `DisplayPanel.qml` without that layout UI.
+[`docs/V2.md`](docs/V2.md). **`v1-legacy`** is the previous default (`master`):
+Display + Miracast without that layout UI. **`v2-dev`** tracks `main` for
+existing checkouts.
 
 This is still the Display dropdown — not a separate cast icon.
 
